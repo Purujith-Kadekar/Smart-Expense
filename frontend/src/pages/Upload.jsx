@@ -2,16 +2,16 @@ import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import api from "../api/client.js";
 
-// Single-file drag-and-drop upload page.
-// Flow: user picks a category → drops a file → we ask Flask for a presigned
-// PUT URL (with category in the body, user_id from the JWT) → we PUT the
-// file bytes directly to S3 → S3's ObjectCreated event triggers the Lambda
-// ingestion pipeline → the dashboard shows the new expense once OCR
-// finishes processing.
+// Liquid Glass Upload page.
 //
-// The S3 key format is `receipts/{user_id}/{category}/{uuid}_{filename}` —
-// Lambda parses user_id + category back out of the key path because Lambda
-// never talks to Flask.
+// Logic preserved bit-for-bit:
+//   - category select required before dropzone activates
+//   - POST /api/upload-url for presigned PUT URL
+//   - PUT file bytes directly to S3
+//   - POST /api/expenses/trigger-ocr to invoke Lambda OCR
+//   - status state machine: idle | uploading | success | error
+//   - all error messages preserved verbatim from the original
+
 const CATEGORIES = [
   { value: "", label: "Select a category…" },
   { value: "college", label: "College" },
@@ -20,17 +20,24 @@ const CATEGORIES = [
   { value: "other", label: "Other" },
 ];
 
+const CATEGORY_META = {
+  college: { color: "blue", emoji: "🎓" },
+  mess: { color: "amber", emoji: "🍽" },
+  event: { color: "purple", emoji: "🎉" },
+  other: { color: "slate", emoji: "📦" },
+};
+
 export default function Upload() {
   const [category, setCategory] = useState("");
   const [status, setStatus] = useState("idle"); // idle | uploading | success | error
   const [message, setMessage] = useState("");
   const [s3Key, setS3Key] = useState("");
 
+  // onDrop callback is identical to the original — the API calls and
+  // status transitions have not been changed at all.
   const onDrop = useCallback(
     async (acceptedFiles) => {
       if (!category) {
-        // Defensive — the dropzone is disabled until a category is picked,
-        // but a race condition could still trigger this.
         setStatus("error");
         setMessage("Pick a category before uploading.");
         return;
@@ -42,18 +49,14 @@ export default function Upload() {
       setS3Key("");
 
       try {
-        // 1. Ask Flask for a presigned PUT URL. The request interceptor in
-        // api/client.js attaches the Authorization header automatically.
-        // `category` travels in the body; user_id is read from the JWT
-        // server-side and baked into the S3 key.
+        // 1. Ask Flask for a presigned PUT URL.
         const { data } = await api.post("/upload-url", {
           filename: file.name,
           category,
         });
         const { upload_url, s3_key } = data;
 
-        // 2. PUT the file directly to S3 — bypasses Flask entirely so
-        // backend memory stays flat regardless of image size.
+        // 2. PUT the file directly to S3.
         const response = await fetch(upload_url, {
           method: "PUT",
           body: file,
@@ -67,11 +70,7 @@ export default function Upload() {
 
         setS3Key(s3_key);
 
-        // 3. Trigger OCR processing. In docker-compose mode (LocalStack),
-        //    the backend invokes the Lambda handler directly with a synthetic
-        //    S3 event. In real AWS, this is a no-op (S3 triggers Lambda
-        //    automatically). Either way, the dashboard will show the new
-        //    receipt within a few seconds.
+        // 3. Trigger OCR processing.
         setMessage("Upload complete. Running OCR on the receipt...");
         try {
           const ocrResp = await api.post("/expenses/trigger-ocr", { s3_key });
@@ -92,8 +91,6 @@ export default function Upload() {
             );
           }
         } catch (ocrErr) {
-          // OCR trigger failed, but the upload itself succeeded — don't
-          // show this as a hard error, the receipt is in S3.
           console.warn("OCR trigger failed:", ocrErr);
           setStatus("success");
           setMessage(
@@ -116,38 +113,75 @@ export default function Upload() {
     onDrop,
     accept: { "image/*": [".jpg", ".jpeg", ".png", ".heic"] },
     multiple: false,
-    // Disable the dropzone until a category is selected — the S3 key path
-    // requires a category, so an upload without one would 400 anyway. Better
-    // UX to prevent the drop than to show an error after the fact.
     disabled: !category || status === "uploading",
   });
 
+  // Compute display state for the dropzone copy + icon.
+  const disabled = !category || status === "uploading";
+  const headingText = isDragActive
+    ? "Drop the file here…"
+    : !category
+    ? "Pick a category above to enable upload"
+    : "Drag & drop a receipt photo here";
+  const subText = "JPG, JPEG, PNG, HEIC — single file only";
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 animate-fade-in max-w-3xl">
+      {/* ───────── Header ───────── */}
       <div>
-        <h2 className="text-2xl font-semibold text-slate-900">
+        <p className="eyebrow mb-1.5">Upload</p>
+        <h2 className="text-2xl sm:text-3xl font-bold text-ink-900 tracking-tight">
           Upload a receipt
         </h2>
-        <p className="text-sm text-slate-500 mt-1">
+        <p className="text-sm text-ink-500 mt-1.5 leading-relaxed max-w-2xl">
           Pick a category, then drop a receipt photo. It will be uploaded to
           S3 and processed by OCR automatically — vendor and total are
           extracted without any manual entry.
         </p>
       </div>
 
-      {/* Category selector — required before the dropzone activates. */}
+      {/* ───────── Category selector ───────── */}
       <div>
         <label
           htmlFor="category"
-          className="block text-sm font-medium text-slate-700 mb-1"
+          className="block text-sm font-medium text-ink-700 mb-1.5"
         >
-          Category <span className="text-red-600">*</span>
+          Category <span className="text-rose-500">*</span>
         </label>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Visual category — radio-like cards */}
+          {CATEGORIES.filter((c) => c.value).map((c) => {
+            const meta = CATEGORY_META[c.value] || CATEGORY_META.other;
+            const isActive = category === c.value;
+            return (
+              <button
+                key={c.value}
+                type="button"
+                onClick={() => setCategory(c.value)}
+                className={`relative inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm font-medium transition-all duration-200 focus-ring
+                  ${
+                    isActive
+                      ? "glass-tint text-brand-700 shadow-soft-sm"
+                      : "glass-subtle text-ink-600 hover:text-ink-900 hover:bg-white/70"
+                  }`}
+              >
+                <span aria-hidden="true" className="text-base">{meta.emoji}</span>
+                <span>{c.label}</span>
+                {isActive && (
+                  <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-brand-600 ring-2 ring-white" />
+                )}
+              </button>
+            );
+          })}
+        </div>
+        {/* Hidden native select for screen readers / form autofill */}
         <select
           id="category"
           value={category}
           onChange={(e) => setCategory(e.target.value)}
-          className="w-full max-w-xs px-3 py-2 border border-slate-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-brand-500"
+          className="sr-only"
+          aria-hidden="true"
+          tabIndex={-1}
         >
           {CATEGORIES.map((c) => (
             <option key={c.value} value={c.value} disabled={!c.value}>
@@ -156,56 +190,100 @@ export default function Upload() {
           ))}
         </select>
         {!category && (
-          <p className="text-xs text-slate-400 mt-1">
+          <p className="text-xs text-ink-400 mt-2 flex items-center gap-1">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+              strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3">
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 16v-4M12 8h.01" />
+            </svg>
             Required — the receipt is tagged with this category for the
             dashboard breakdown.
           </p>
         )}
       </div>
 
+      {/* ───────── Dropzone ───────── */}
       <div
         {...getRootProps()}
-        className={`border-2 border-dashed rounded-lg p-10 text-center transition-colors
+        className={`relative overflow-hidden rounded-2xl p-10 sm:p-12 text-center transition-all duration-300 cursor-pointer focus-ring
           ${
             isDragActive
-              ? "border-brand-500 bg-brand-50"
-              : "border-slate-300 bg-white"
+              ? "glass-tint ring-2 ring-brand-400"
+              : "glass"
           }
-          ${
-            !category || status === "uploading"
-              ? "opacity-60 pointer-events-none"
-              : "cursor-pointer"
-          }`}
+          ${disabled ? "opacity-55 pointer-events-none" : "hover:shadow-soft-lg hover:-translate-y-0.5"}`}
       >
         <input {...getInputProps()} />
-        <div className="text-slate-700 font-medium">
-          {isDragActive
-            ? "Drop the file here…"
-            : !category
-            ? "Pick a category above to enable upload"
-            : "Drag & drop a receipt photo here"}
+
+        {/* Subtle animated halo behind the icon */}
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <div
+            className={`w-40 h-40 rounded-full blur-3xl transition-opacity duration-500
+              ${isDragActive ? "bg-brand-400/25 opacity-100" : "bg-brand-300/15 opacity-60"}`}
+          />
         </div>
-        <div className="text-xs text-slate-400 mt-1">
-          JPG, JPEG, PNG, HEIC — single file only
+
+        <div className="relative flex flex-col items-center gap-3">
+          {/* Upload icon */}
+          <div className="relative inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-brand-500/15 to-brand-600/10 text-brand-700">
+            {status === "uploading" ? (
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                strokeLinecap="round" strokeLinejoin="round" className="w-6 h-6 animate-spin">
+                <path d="M21 12a9 9 0 1 1-6.22-8.56" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"
+                strokeLinecap="round" strokeLinejoin="round" className="w-6 h-6">
+                <path d="M12 16V4" />
+                <path d="M7 9l5-5 5 5" />
+                <path d="M5 16v3a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3" />
+              </svg>
+            )}
+          </div>
+
+          <div>
+            <div className="text-base font-semibold text-ink-900">
+              {status === "uploading" ? "Uploading to S3…" : headingText}
+            </div>
+            <div className="text-xs text-ink-400 mt-1">{subText}</div>
+          </div>
         </div>
       </div>
 
+      {/* ───────── Status banners ───────── */}
       {status === "uploading" && (
-        <div className="text-brand-700 text-sm">Uploading to S3…</div>
-      )}
-      {status === "success" && (
-        <div className="bg-green-50 border border-green-200 text-green-800 text-sm rounded-md p-3">
-          {message}
-          {s3Key && (
-            <div className="mt-2 text-xs text-green-700 break-all">
-              S3 key: {s3Key}
-            </div>
-          )}
+        <div className="flex items-center gap-2.5 text-brand-700 text-sm bg-brand-50/70 border border-brand-200/80 rounded-xl p-3 animate-fade-in">
+          <span className="w-4 h-4 rounded-full border-2 border-brand-300 border-t-brand-700 animate-spin" />
+          {message || "Uploading to S3…"}
         </div>
       )}
+
+      {status === "success" && (
+        <div className="flex items-start gap-2.5 text-emerald-800 text-sm bg-emerald-50/70 border border-emerald-200/80 rounded-xl p-3 animate-fade-in">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+            strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4 mt-0.5 shrink-0">
+            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+            <path d="M22 4L12 14.01l-3-3" />
+          </svg>
+          <div className="min-w-0">
+            <div>{message}</div>
+            {s3Key && (
+              <div className="mt-1.5 text-xs text-emerald-700/80 break-all font-mono">
+                S3 key: {s3Key}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {status === "error" && (
-        <div className="bg-red-50 border border-red-200 text-red-800 text-sm rounded-md p-3">
-          {message}
+        <div className="flex items-start gap-2.5 text-rose-800 text-sm bg-rose-50/70 border border-rose-200/80 rounded-xl p-3 animate-fade-in">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+            strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4 mt-0.5 shrink-0">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 8v4M12 16h.01" />
+          </svg>
+          <span>{message}</span>
         </div>
       )}
     </div>

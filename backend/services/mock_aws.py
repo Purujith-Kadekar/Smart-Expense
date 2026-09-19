@@ -11,10 +11,17 @@ between mock and real is done via environment variable so the production
 code path is unchanged.
 """
 
+import json
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
+
+
+# When set, the in-memory mock persists every write to this JSON file and
+# reloads it on the next start — so `python app.py` (no Docker, no AWS
+# account) keeps accounts, budgets and receipts between restarts.
+_PERSIST_FILE = os.environ.get("MOCK_PERSIST_FILE", "").strip()
 
 
 class _MockDynamoTable:
@@ -58,6 +65,8 @@ class _MockDynamoTable:
     def put_item(self, Item):
         with self._lock:
             self._items[self._item_key(Item)] = dict(Item)
+        if _PERSIST_FILE:
+            _snapshot_to_disk()
 
     def get_item(self, Key):
         with self._lock:
@@ -111,8 +120,116 @@ class _MockDynamoResource:
     def Table(self, name):
         if name not in self._tables:
             partition_key, sort_key = _TABLE_KEYS.get(name, ("id", None))
-            self._tables[name] = _MockDynamoTable(name, partition_key, sort_key)
+            table = _MockDynamoTable(name, partition_key, sort_key)
+            if _PERSIST_FILE:
+                _hydrate_from_disk(table)
+            self._tables[name] = table
         return self._tables[name]
+
+
+# ---------------------------------------------------------------------------
+# File persistence (MOCK_PERSIST_FILE)
+# ---------------------------------------------------------------------------
+#
+# Items stored via put_item have already been through dynamo._to_dynamo(),
+# so they contain Decimal values — JSON has no Decimal. We round-trip them
+# through a tagged dict ({"__decimal__": "123.45"}) so precision survives
+# the save/load cycle exactly.
+
+_PERSIST_LOCK = threading.Lock()
+_PERSIST_CACHE = None  # parsed file contents, loaded once per process
+_DECIMAL_TAG = "__decimal__"
+
+
+def _encode_for_disk(value):
+    """Convert an item (dict/list/Decimal/...) into JSON-safe structures."""
+    from decimal import Decimal
+
+    if isinstance(value, Decimal):
+        return {_DECIMAL_TAG: str(value)}
+    if isinstance(value, dict):
+        return {k: _encode_for_disk(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_for_disk(v) for v in value]
+    return value
+
+
+def _decode_from_disk(value):
+    """Inverse of _encode_for_disk — restores Decimal from the tag."""
+    from decimal import Decimal
+
+    if isinstance(value, dict):
+        if set(value.keys()) == {_DECIMAL_TAG}:
+            return Decimal(str(value[_DECIMAL_TAG]))
+        return {k: _decode_from_disk(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode_from_disk(v) for v in value]
+    return value
+
+
+def _read_persist_file():
+    """Parse the persist file once and cache it. Returns {} when unset or
+    unreadable (a corrupt file must never crash the backend — worst case we
+    start from an empty store, same as without persistence)."""
+    global _PERSIST_CACHE
+    if not _PERSIST_FILE:
+        return {}
+    if _PERSIST_CACHE is None:
+        try:
+            with open(_PERSIST_FILE, "r", encoding="utf-8") as fh:
+                _PERSIST_CACHE = json.load(fh)
+        except FileNotFoundError:
+            _PERSIST_CACHE = {}
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[mock-aws] MOCK_PERSIST_FILE unreadable ({exc}) — starting empty")
+            _PERSIST_CACHE = {}
+    return _PERSIST_CACHE
+
+
+def _hydrate_from_disk(table):
+    """Load a newly created mock table's items from the persist file."""
+    data = _read_persist_file()
+    items = (data.get("tables") or {}).get(table.name) or []
+    with table._lock:
+        for raw in items:
+            item = _decode_from_disk(raw)
+            try:
+                table._items[table._item_key(item)] = dict(item)
+            except KeyError:
+                # Item without the partition key — skip rather than crash.
+                continue
+
+
+def _snapshot_to_disk():
+    """Atomically write every mock table's items to the persist file.
+
+    Called after each put_item — hackathon write rates make this cheap, and
+    write-through means a Ctrl-C can never lose acknowledged data. The
+    tmp-file + os.replace rename is atomic on POSIX and Windows, so a crash
+    mid-write can never corrupt the previous snapshot.
+    """
+    if not _PERSIST_FILE:
+        return
+    with _PERSIST_LOCK:
+        tables = {}
+        for name, table in _DYNAMO._tables.items():
+            with table._lock:
+                tables[name] = [_encode_for_disk(dict(v)) for v in table._items.values()]
+        payload = {
+            "version": 1,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "tables": tables,
+        }
+        try:
+            directory = os.path.dirname(os.path.abspath(_PERSIST_FILE))
+            os.makedirs(directory, exist_ok=True)
+            tmp_path = _PERSIST_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp_path, _PERSIST_FILE)
+        except OSError as exc:
+            # Never let a persistence hiccup fail the actual API write.
+            print(f"[mock-aws] could not persist to {_PERSIST_FILE}: {exc}")
 
 
 class _MockSNSClient:
@@ -332,3 +449,61 @@ def get_ses_client():
     if endpoint:
         kwargs["endpoint_url"] = endpoint
     return boto3.client("ses", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Storage-mode introspection — powers GET /api/system/storage and the
+# frontend storage banner, so "why isn't my data persisting?" is answerable
+# at a glance instead of guesswork.
+# ---------------------------------------------------------------------------
+
+def storage_mode_info():
+    """Describe which storage backend the services are wired to right now.
+
+    Returns a dict:
+      mode        "mock"       — in-memory dicts (nothing survives restart
+                                 unless persist_file is set)
+                  "localstack" — real boto3 against an AWS-compatible local
+                                 endpoint (LocalStack, moto, dynamodb-local)
+                  "aws"        — real boto3 against real Amazon DynamoDB
+      endpoint    the AWS_ENDPOINT_URL in use, or None for real AWS
+      persistent  whether data survives a backend restart in this mode
+      persist_file  mock mode only — the MOCK_PERSIST_FILE path in use
+    """
+    mock = is_mock_mode()
+    endpoint = (os.environ.get("AWS_ENDPOINT_URL") or "").strip() or None
+    persist_file = _PERSIST_FILE or None
+    if mock:
+        mode = "mock"
+    elif endpoint:
+        mode = "localstack"
+    else:
+        mode = "aws"
+
+    if mode == "aws":
+        persistent = True
+    elif mode == "mock":
+        persistent = bool(persist_file)
+    else:
+        # LocalStack snapshots require Pro (PERSISTENCE is ignored by the
+        # Community image — state lives only in the container's memory and
+        # dies on stop/down/restart).
+        persistent = os.environ.get("PERSISTENCE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+    return {
+        "mode": mode,
+        "endpoint": endpoint,
+        "persistent": persistent,
+        "persist_file": persist_file,
+    }
+
+
+def mock_item_counts():
+    """Item count per mock table (mock mode only). Ensures each table object
+    exists (and is hydrated from the persist file) before counting."""
+    counts = {}
+    for name in {_EXPENSES_TABLE, _USERS_TABLE, _BUDGETS_TABLE}:
+        table = _DYNAMO.Table(name)
+        with table._lock:
+            counts[name] = len(table._items)
+    return counts

@@ -1,4 +1,4 @@
-# Smart Campus Expense & Invoice Verifier — full local stack.
+# Outlay — full local stack.
 #
 #   docker-compose up --build
 #   open http://localhost:5173
@@ -17,14 +17,22 @@ services:
   # see a token prompt, you have pulled a Pro image tag, not Community.
   localstack:
     image: localstack/localstack:3.8.1
-    container_name: campus-localstack
+    container_name: outlay-localstack
     ports:
       - "4566:4566"          # single edge port for every service
     environment:
       - SERVICES=s3,dynamodb,sns,ses
       - DEBUG=0
       - AWS_DEFAULT_REGION=us-east-1
-      - PERSISTENCE=0
+      # ⚠ DATA LOSS WARNING: LocalStack COMMUNITY keeps all state (DynamoDB
+      # tables, S3 objects) in container memory only — `docker compose
+      # down/stop/restart` (or a rebuild after code changes) WIPES every
+      # account, budget and receipt. PERSISTENCE=1 activates disk snapshots
+      # on LocalStack PRO (Community ignores it — harmless to leave at 1;
+      # the localstack-data volume below is only used when snapshots are
+      # active). For durable storage without Pro: point the backend at real
+      # AWS DynamoDB — see README "Storage & persistence".
+      - PERSISTENCE=1
       # No DOCKER_HOST / docker.sock mount: we never ask LocalStack to spawn
       # a Lambda container. The backend imports and calls the handler in
       # process, which is faster and removes the socket mount entirely.
@@ -40,12 +48,14 @@ services:
   # --- One-shot: create bucket + tables + SNS topic, then exit ---
   localstack-init:
     image: python:3.11-slim
-    container_name: campus-localstack-init
+    container_name: outlay-localstack-init
     depends_on:
       localstack:
         condition: service_healthy
     environment:
       - LOCALSTACK_ENDPOINT=http://localstack:4566
+      # To create the tables in REAL AWS instead (durable demo storage), run
+      # on the host instead of here:  python localstack/init.py --aws
       - AWS_REGION=us-east-1
       - AWS_DEFAULT_REGION=us-east-1
       - AWS_ACCESS_KEY_ID=test
@@ -70,7 +80,7 @@ services:
       args:
         # easyocr (default, accurate, big) | tesseract (fast, small)
         OCR_ENGINE: easyocr
-    container_name: campus-backend
+    container_name: outlay-backend
     depends_on:
       localstack:
         condition: service_healthy
@@ -103,9 +113,19 @@ services:
       - OCR_ENGINE=easyocr
       - EASYOCR_MODULE_PATH=/opt/easyocr
       - BUDGET_LIMIT=20000
+      # FX conversion (receipt currency -> INR, frozen at upload).
+      # FX_API_URL is the free keyless live-rate feed, fetched automatically
+      # by the ingestion pipeline — no exchange-rates UI exists. FX_CACHE_TTL
+      # keeps bursts of uploads from re-fetching it for every receipt (60s),
+      # FX_TIMEOUT keeps a dead network from stalling ingestion (3s, then
+      # the built-in fallback rates are used and records are stamped
+      # fx_source="fallback").
+      - FX_API_URL=https://open.er-api.com/v6/latest/INR
+      - FX_CACHE_TTL=60
+      - FX_TIMEOUT=3
       - JWT_SECRET=docker-compose-dev-secret-change-in-production
       - JWT_EXPIRY_HOURS=24
-      - SES_VERIFIED_SENDER=noreply@campus.local
+      - SES_VERIFIED_SENDER=noreply@outlay.local
       - ALLOWED_ORIGINS=http://localhost:5173,http://localhost:4566
       # MOCK_AWS is deliberately unset: real boto3 calls, aimed at LocalStack.
       - FLASK_DEBUG=0
@@ -123,7 +143,7 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
-    container_name: campus-frontend
+    container_name: outlay-frontend
     depends_on:
       backend:
         condition: service_healthy

@@ -1,19 +1,38 @@
 import { useState } from "react";
 import api from "../api/client.js";
 
-// Expense table with:
-//   - per-row checkboxes for selection
-//   - a running "N selected, total ₹X" summary
-//   - an inline email form (recipient + description + Send button) that
-//     calls POST /api/expenses/email with the selected receipt_ids.
+// Liquid Glass ExpenseTable.
 //
-// The email form reuses the same success/error message pattern as
-// Upload.jsx (green box on success, red box on error).
+// Logic preserved bit-for-bit:
+//   - per-row checkboxes (Set-based selection)
+//   - toggle all
+//   - running "N selected, total ₹X" summary
+//   - inline email form (recipient + description + Send)
+//   - POST /api/expenses/email with receipt_ids, recipient_email, description
+//   - success/error messages with the same error-code mapping as the original
+//   - empty state when no expenses
+//   - per-row "Over budget" / "Within budget" badge
+//   - per-row category chip with color
+
+// Category → glass chip color classes. Same hues as the original but the
+// surfaces are translucent to match the glass aesthetic.
 const CATEGORY_STYLES = {
-  college: "bg-blue-50 text-blue-700",
-  mess: "bg-amber-50 text-amber-700",
-  event: "bg-purple-50 text-purple-700",
-  other: "bg-slate-100 text-slate-600",
+  college: {
+    glass: "bg-blue-500/15 text-blue-700 border-blue-400/30",
+    dot: "bg-blue-500",
+  },
+  mess: {
+    glass: "bg-amber-500/15 text-amber-700 border-amber-400/30",
+    dot: "bg-amber-500",
+  },
+  event: {
+    glass: "bg-purple-500/15 text-purple-700 border-purple-400/30",
+    dot: "bg-purple-500",
+  },
+  other: {
+    glass: "bg-ink-500/15 text-ink-700 border-ink-400/30",
+    dot: "bg-ink-500",
+  },
 };
 
 export default function ExpenseTable({ expenses }) {
@@ -24,10 +43,20 @@ export default function ExpenseTable({ expenses }) {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
+  // Empty state — identical copy and intent as the original.
   if (!expenses || expenses.length === 0) {
     return (
-      <div className="text-sm text-slate-500 italic">
-        No expenses recorded yet. Upload a receipt to get started.
+      <div className="glass rounded-2xl p-10 text-center animate-fade-in">
+        <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-gradient-to-br from-ink-500/15 to-ink-700/10 text-ink-500 mb-3">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"
+            strokeLinecap="round" strokeLinejoin="round" className="w-5 h-5">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" />
+          </svg>
+        </div>
+        <p className="text-sm font-medium text-ink-700">No expenses recorded yet.</p>
+        <p className="text-xs text-ink-400 mt-1">
+          Upload a receipt to get started.
+        </p>
       </div>
     );
   }
@@ -55,6 +84,8 @@ export default function ExpenseTable({ expenses }) {
     }
   };
 
+  // handleSendEmail — identical to the original, including all the
+  // backend error-code → user-message mappings.
   const handleSendEmail = async (e) => {
     e.preventDefault();
     setSending(true);
@@ -93,88 +124,161 @@ export default function ExpenseTable({ expenses }) {
     }
   };
 
+  const allSelected = selected.size === expenses.length && expenses.length > 0;
+
   return (
-    <div className="space-y-3">
-      <div className="overflow-x-auto bg-white border border-slate-200 rounded-lg">
-        <table className="min-w-full divide-y divide-slate-200 text-sm">
-          <thead className="bg-slate-50">
-            <tr>
-              <th className="px-4 py-2 text-left w-10">
-                <input
-                  type="checkbox"
-                  checked={selected.size === expenses.length && expenses.length > 0}
-                  onChange={toggleAll}
-                  className="rounded border-slate-300"
-                  aria-label="Select all"
-                />
-              </th>
-              <th className="px-4 py-2 text-left font-medium text-slate-600">Vendor</th>
-              <th className="px-4 py-2 text-left font-medium text-slate-600">Category</th>
-              <th className="px-4 py-2 text-left font-medium text-slate-600">Date</th>
-              <th className="px-4 py-2 text-right font-medium text-slate-600">Amount</th>
-              <th className="px-4 py-2 text-center font-medium text-slate-600">Status</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100">
-            {expenses.map((e) => {
-              const cat = e.category || "other";
-              const chipStyle = CATEGORY_STYLES[cat] || CATEGORY_STYLES.other;
-              const isSelected = selected.has(e.expense_id);
-              return (
-                <tr
-                  key={e.expense_id}
-                  className={isSelected ? "bg-brand-50" : "hover:bg-slate-50"}
-                >
-                  <td className="px-4 py-2">
+    <div className="space-y-3 animate-fade-in">
+      {/* ───────── Table card ───────── */}
+      <div className="glass rounded-2xl overflow-hidden shadow-soft">
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-white/40 text-sm">
+            <thead>
+              <tr className="bg-white/30">
+                <th scope="col" className="px-4 py-3 text-left w-10">
+                  <label className="inline-flex items-center justify-center cursor-pointer">
                     <input
                       type="checkbox"
-                      checked={isSelected}
-                      onChange={() => toggleRow(e.expense_id)}
-                      className="rounded border-slate-300"
-                      aria-label={`Select ${e.vendor}`}
+                      checked={allSelected}
+                      onChange={toggleAll}
+                      className="peer sr-only"
+                      aria-label="Select all"
                     />
-                  </td>
-                  <td className="px-4 py-2 text-slate-900">{e.vendor || "—"}</td>
-                  <td className="px-4 py-2">
-                    <span
-                      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium capitalize ${chipStyle}`}
-                    >
-                      {cat}
+                    <span className="w-4.5 h-4.5 rounded-md border border-ink-300 bg-white/70 peer-checked:bg-brand-600 peer-checked:border-brand-600 peer-focus-visible:ring-2 peer-focus-visible:ring-brand-400/60 transition-all flex items-center justify-center">
+                      {allSelected && (
+                        <svg viewBox="0 0 16 16" fill="none" stroke="white" strokeWidth="2"
+                          strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3">
+                          <path d="M3 8.5l3 3 7-7" />
+                        </svg>
+                      )}
                     </span>
-                  </td>
-                  <td className="px-4 py-2 text-slate-600">{e.date || "—"}</td>
-                  <td className="px-4 py-2 text-right text-slate-900">
-                    ₹{Number(e.amount || 0).toLocaleString()}
-                  </td>
-                  <td className="px-4 py-2 text-center">
-                    {e.over_budget ? (
-                      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-warn-50 text-warn-700">
-                        Over budget
+                  </label>
+                </th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-ink-500">
+                  Vendor
+                </th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-ink-500">
+                  Category
+                </th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-ink-500">
+                  Date
+                </th>
+                <th scope="col" className="px-4 py-3 text-right font-medium text-ink-500">
+                  Amount
+                </th>
+                <th scope="col" className="px-4 py-3 text-center font-medium text-ink-500">
+                  Status
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/40">
+              {expenses.map((e, i) => {
+                const cat = e.category || "other";
+                const chipStyle = CATEGORY_STYLES[cat] || CATEGORY_STYLES.other;
+                const isSelected = selected.has(e.expense_id);
+                return (
+                  <tr
+                    key={e.expense_id}
+                    className={`group transition-colors duration-200 ${
+                      isSelected
+                        ? "bg-brand-50/60"
+                        : "hover:bg-white/45"
+                    }`}
+                    style={{ animationDelay: `${i * 30}ms` }}
+                  >
+                    <td className="px-4 py-3">
+                      <label className="inline-flex items-center justify-center cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => toggleRow(e.expense_id)}
+                          className="peer sr-only"
+                          aria-label={`Select ${e.vendor}`}
+                        />
+                        <span className={`w-4.5 h-4.5 rounded-md border transition-all flex items-center justify-center
+                          ${isSelected
+                            ? "bg-brand-600 border-brand-600"
+                            : "border-ink-300 bg-white/70 group-hover:border-ink-400"}
+                          peer-focus-visible:ring-2 peer-focus-visible:ring-brand-400/60`}>
+                          {isSelected && (
+                            <svg viewBox="0 0 16 16" fill="none" stroke="white" strokeWidth="2"
+                              strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3">
+                              <path d="M3 8.5l3 3 7-7" />
+                            </svg>
+                          )}
+                        </span>
+                      </label>
+                    </td>
+                    <td className="px-4 py-3 text-ink-900 font-medium">
+                      {e.vendor || "—"}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span
+                        className={`chip border ${chipStyle.glass}`}
+                      >
+                        <span className={`w-1.5 h-1.5 rounded-full ${chipStyle.dot}`} />
+                        {cat}
                       </span>
-                    ) : (
-                      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-50 text-green-700">
-                        Within budget
-                      </span>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+                    </td>
+                    <td className="px-4 py-3 text-ink-600 tabular-nums">
+                      {e.date || "—"}
+                    </td>
+                    <td className="px-4 py-3 text-right text-ink-900 font-semibold tabular-nums">
+                      ₹{Number(e.amount || 0).toLocaleString()}
+                    </td>
+                    <td className="px-4 py-3 text-center">
+                      {e.over_budget ? (
+                        <span className="chip border border-amber-400/30 bg-amber-500/15 text-amber-700">
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                          Over budget
+                        </span>
+                      ) : (
+                        <span className="chip border border-emerald-400/30 bg-emerald-500/15 text-emerald-700">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                          Within budget
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
 
-      {/* Selection summary + email form — only show when at least one row is selected. */}
+      {/* ───────── Selection summary + email form — only show when at least one row is selected ───────── */}
       {selected.size > 0 && (
-        <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-3">
-          <div className="text-sm text-slate-700">
-            <span className="font-medium">{selected.size}</span> selected ·{" "}
-            <span className="font-medium">₹{selectedTotal.toLocaleString()}</span> total
+        <div className="glass-tint rounded-2xl p-4 sm:p-5 space-y-3 animate-scale-in">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2 text-sm text-ink-700">
+              <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-brand-600 text-white text-xs font-bold shadow-brand">
+                {selected.size}
+              </span>
+              <span className="font-medium">{selected.size}</span> selected ·{" "}
+              <span className="font-semibold text-ink-900">
+                ₹{selectedTotal.toLocaleString()}
+              </span>{" "}
+              total
+            </div>
+            <button
+              type="button"
+              onClick={() => setSelected(new Set())}
+              className="btn-ghost !text-ink-500"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+                strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
+                <path d="M18 6L6 18M6 6l12 12" />
+              </svg>
+              Clear selection
+            </button>
           </div>
 
-          <form onSubmit={handleSendEmail} className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <form
+            onSubmit={handleSendEmail}
+            className="grid grid-cols-1 sm:grid-cols-2 gap-3"
+          >
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
+              <label className="block text-xs font-medium text-ink-600 mb-1">
                 Recipient email
               </label>
               <input
@@ -183,11 +287,11 @@ export default function ExpenseTable({ expenses }) {
                 onChange={(e) => setRecipientEmail(e.target.value)}
                 required
                 placeholder="advisor@example.edu"
-                className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+                className="input-glass text-sm"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
+              <label className="block text-xs font-medium text-ink-600 mb-1">
                 Description (optional)
               </label>
               <input
@@ -195,35 +299,52 @@ export default function ExpenseTable({ expenses }) {
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="September cultural fest expenses"
-                className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+                className="input-glass text-sm"
               />
             </div>
-            <div className="sm:col-span-2 flex items-center gap-3">
+            <div className="sm:col-span-2 flex items-center gap-3 pt-1">
               <button
                 type="submit"
                 disabled={sending}
-                className="px-4 py-2 bg-brand-600 text-white rounded-md text-sm font-medium hover:bg-brand-700 disabled:opacity-60 transition-colors"
+                className="btn-primary"
               >
-                {sending ? "Sending…" : `Email ${selected.size} receipt${selected.size > 1 ? "s" : ""} as bill`}
-              </button>
-              <button
-                type="button"
-                onClick={() => setSelected(new Set())}
-                className="px-3 py-2 text-sm text-slate-600 hover:text-slate-900"
-              >
-                Clear selection
+                {sending ? (
+                  <>
+                    <span className="w-4 h-4 rounded-full border-2 border-white/40 border-t-white animate-spin" />
+                    Sending…
+                  </>
+                ) : (
+                  <>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+                      strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
+                      <rect x="3" y="5" width="18" height="14" rx="2.5" />
+                      <path d="M4 7l8 6 8-6" />
+                    </svg>
+                    {`Email ${selected.size} receipt${selected.size > 1 ? "s" : ""} as bill`}
+                  </>
+                )}
               </button>
             </div>
           </form>
 
           {message && (
-            <div className="bg-green-50 border border-green-200 text-green-800 text-sm rounded-md p-2">
-              {message}
+            <div className="flex items-start gap-2 text-emerald-700 text-sm bg-emerald-50/70 border border-emerald-200/80 rounded-xl p-2.5 animate-fade-in">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+                strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4 mt-0.5 shrink-0">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                <path d="M22 4L12 14.01l-3-3" />
+              </svg>
+              <span>{message}</span>
             </div>
           )}
           {error && (
-            <div className="bg-red-50 border border-red-200 text-red-800 text-sm rounded-md p-2">
-              {error}
+            <div className="flex items-start gap-2 text-rose-700 text-sm bg-rose-50/70 border border-rose-200/80 rounded-xl p-2.5 animate-fade-in">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+                strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4 mt-0.5 shrink-0">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M12 8v4M12 16h.01" />
+              </svg>
+              <span>{error}</span>
             </div>
           )}
         </div>

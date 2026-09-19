@@ -45,7 +45,7 @@ def generate_presigned_upload(s3_key, content_type=None, expires_in=300):
     """Return a presigned S3 PUT URL valid for `expires_in` seconds.
 
     The frontend PUTs the raw image bytes to this URL. Five minutes is
-    ample for a phone photo on campus wifi.
+    ample for a phone photo on any wifi.
 
     `content_type` is deliberately NOT included in the signed parameters.
     If it were, the browser would have to send back a byte-identical

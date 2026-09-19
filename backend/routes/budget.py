@@ -89,7 +89,13 @@ def get_budget_status():
     """Return the user's budget + spending summary for a month.
 
     Query:    ?month=2026-09  (defaults to current UTC month)
-    Response: { "month", "budget_limit", "income", "total_spent", "savings" }
+    Response: { "month", "budget_limit", "income", "total_spent", "savings",
+                "base_currency" }
+
+    Every monetary field is in INR (base_currency="INR"): the user enters
+    budget/income in rupees, and expense `amount` values are the frozen
+    INR-converted values written at ingest time — so total_spent and
+    savings are always rupees, whatever currency the receipts were in.
 
     If no budget has been set for the month, budget_limit and income are
     returned as 0 — the client can prompt the user to set one. We don't
@@ -124,4 +130,5 @@ def get_budget_status():
         "income": income,
         "total_spent": total_spent,
         "savings": savings,
+        "base_currency": "INR",
     })

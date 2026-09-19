@@ -1,5 +1,5 @@
 """
-Smart Campus Expense & Invoice Verifier — Flask backend
+Outlay — Flask backend
 
 Entrypoint: registers CORS, wires up the route blueprints, and starts the
 dev server. Everything runs locally against LocalStack — there is no cloud
@@ -12,27 +12,34 @@ except /register, /login, and /health):
     POST /api/login               — authenticate, returns JWT
 
     POST /api/upload-url          — presigned S3 PUT URL (category required)
-    GET  /api/expenses            — list caller's receipts (per-user)
+    GET  /api/expenses            — list caller's receipts (per-user, INR)
     GET  /api/expenses/<id>       — single receipt (ownership-checked)
     POST /api/expenses/email      — email selected receipts as a bill via SES
 
     GET  /api/budget?month=YYYY-MM — budget_limit, income, total_spent, savings
     POST /api/budget               — upsert monthly budget (limit + income)
 
+    GET  /api/system/storage      — which DynamoDB is in use + reachability
+                                     (no auth) — answers "why isn't data saving?"
     GET  /health                   — liveness probe (no auth)
+
+All monetary amounts in API responses are INR (₹). Receipts detected in a
+foreign currency are converted to INR automatically at upload time using
+the live rate fetched by the ingestion pipeline — see lambda/fx.py. There
+is deliberately NO exchange-rates API or UI: conversion is invisible.
 """
 
 import os
 
 from dotenv import load_dotenv
-from flask import Flask
+from flask import Flask, jsonify
 from flask_cors import CORS
 
 from routes.upload import upload_bp
 from routes.expenses import expenses_bp
 from routes.budget import budget_bp
 from routes.auth import auth_bp
-from services.mock_aws import is_mock_mode
+from services.mock_aws import mock_item_counts, storage_mode_info
 
 # Load variables from backend/.env when present (local dev). On Elastic
 # Beanstalk these come from environment properties instead, so missing
@@ -40,6 +47,40 @@ from services.mock_aws import is_mock_mode
 load_dotenv()
 
 app = Flask(__name__)
+
+# Storage-failure surfacing: any UNHANDLED botocore error (LocalStack down,
+# missing table, credential problem) becomes a clean JSON 503 instead of
+# an HTML 500 — so the frontend can finally answer "why isn't this
+# saving?". Import is guarded because a mock-only dev box may not have
+# boto3 installed (services/mock_aws.py imports it lazily for the same
+# reason).
+try:
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:  # pragma: no cover — mock-only dev without boto3
+    BotoCoreError = ClientError = None
+
+if BotoCoreError is not None:
+
+    @app.errorhandler(BotoCoreError)
+    @app.errorhandler(ClientError)
+    def _storage_backend_error(err):
+        """Translate botocore failures into a JSON 503 with the real cause.
+
+        ClientError examples this catches: ResourceNotFoundException (the
+        tables were never created — run localstack/init.py),
+        UnrecognizedClientException / AccessDeniedException (bad AWS
+        credentials). BotoCoreError examples: EndpointConnectionError
+        (LocalStack is not running / wrong AWS_ENDPOINT_URL).
+        """
+        app.logger.exception("Storage backend error")
+        return jsonify({
+            "error": "storage_unavailable",
+            "detail": str(err),
+            "hint": "The backend cannot reach its storage (DynamoDB/S3). "
+                    "Check GET /api/system/storage — common causes: "
+                    "LocalStack not running, tables never created "
+                    "(localstack/init.py), or a wrong AWS_ENDPOINT_URL.",
+        }), 503
 
 # Determine which AWS backend to use:
 #   - MOCK_AWS=1 → in-memory stubs (for `python app.py` dev without Docker)
@@ -49,12 +90,23 @@ app = Flask(__name__)
 # MOCK_AWS isn't explicitly set, it defaults to mock so `python app.py`
 # works zero-config. In docker-compose, MOCK_AWS is unset and
 # AWS_ENDPOINT_URL points at LocalStack, so real boto3 calls are used.
-if is_mock_mode():
-    print("[backend] MOCK_AWS active — using in-memory stubs (no AWS credentials found)")
+_storage = storage_mode_info()
+if _storage["mode"] == "mock":
+    if _storage["persistent"]:
+        print(f"[backend] MOCK_AWS active — in-memory stubs, persisted to {_storage['persist_file']}")
+    else:
+        print("[backend] MOCK_AWS active — in-memory stubs (no AWS credentials found)")
+        print("[backend] WARNING: in-memory storage RESETS on every restart — accounts,")
+        print("[backend] budgets and receipts will vanish. Set MOCK_PERSIST_FILE in")
+        print("[backend] backend/.env to keep data (see README 'Storage & persistence').")
     print("[backend] For the full stack: docker-compose up (uses LocalStack)")
+elif _storage["mode"] == "aws":
+    print("[backend] Storage: real Amazon DynamoDB/S3 (durable) — AWS_ENDPOINT_URL unset")
 else:
-    endpoint = os.environ.get("AWS_ENDPOINT_URL", "real AWS")
-    print(f"[backend] Connecting to {endpoint}")
+    print(f"[backend] Storage: {_storage['endpoint']} (AWS-compatible local endpoint)")
+    if not _storage["persistent"]:
+        print("[backend] NOTE: LocalStack Community keeps state in memory only —")
+        print("[backend] restarting the stack wipes accounts/budgets/receipts.")
 
 # CORS — hardened for cross-domain dev/deploy. The React dev server runs on
 # a different origin (http://localhost:5173) than Flask (http://localhost:5000),
@@ -131,6 +183,105 @@ app.register_blueprint(auth_bp, url_prefix="/api")
 def health():
     """Liveness probe used by the docker-compose healthcheck."""
     return {"status": "ok", "service": "outlay-backend"}
+
+
+@app.get("/api/system/storage")
+def storage_diagnostics():
+    """Which storage backend is active, and is it actually reachable?
+
+    This is the "why isn't my data saving?" endpoint. No auth (like
+    /health) so it can be checked from a browser or curl even when login
+    itself is broken (e.g. the Users table is missing).
+
+    Response: {
+      "storage": { mode, endpoint, persistent, persist_file },
+      "tables": { expenses|users|budgets: { table, reachable, status,
+                                             item_count, engine, error? } },
+      "s3":     { bucket, reachable, note? , error? },
+      "checked_at": <iso8601>
+    }
+
+    In non-mock modes the checks use throwaway clients with 2-3s timeouts
+    and no retries, so a dead endpoint answers "reachable: false" quickly
+    instead of hanging the diagnostics call for a minute.
+    """
+    from datetime import datetime, timezone
+
+    info = storage_mode_info()
+    table_names = {
+        "expenses": os.environ.get("TABLE_NAME", "ExpenseRecords"),
+        "users": os.environ.get("USERS_TABLE_NAME", "Users"),
+        "budgets": os.environ.get("BUDGETS_TABLE_NAME", "Budgets"),
+    }
+    bucket = os.environ.get("S3_BUCKET", "receipts-bucket")
+    tables = {"expenses": None, "users": None, "budgets": None}
+    s3 = {"bucket": bucket}
+
+    if info["mode"] == "mock":
+        counts = mock_item_counts()
+        for label, name in table_names.items():
+            tables[label] = {
+                "table": name,
+                "reachable": True,
+                "status": "ACTIVE",
+                "item_count": counts.get(name, 0),
+                "engine": "in-memory"
+                + (" + file" if info["persist_file"] else ""),
+            }
+        s3.update({"reachable": True, "note": "mock — objects are not stored"})
+    else:
+        import boto3
+        from botocore.client import Config
+
+        fast = Config(connect_timeout=2, read_timeout=3,
+                      retries={"max_attempts": 1})
+        client_kwargs = {
+            "region_name": os.environ.get("AWS_REGION", "us-east-1"),
+            "config": fast,
+        }
+        if info["endpoint"]:
+            client_kwargs["endpoint_url"] = info["endpoint"]
+        try:
+            dynamo = boto3.client("dynamodb", **client_kwargs)
+            for label, name in table_names.items():
+                try:
+                    described = dynamo.describe_table(TableName=name)
+                    meta = described.get("Table", {})
+                    tables[label] = {
+                        "table": name,
+                        "reachable": True,
+                        "status": meta.get("TableStatus", "UNKNOWN"),
+                        "item_count": meta.get("ItemCount", 0),
+                        "engine": info["endpoint"] or "real AWS",
+                    }
+                except Exception as exc:  # ClientError per table
+                    tables[label] = {
+                        "table": name,
+                        "reachable": False,
+                        "engine": info["endpoint"] or "real AWS",
+                        "error": str(exc),
+                    }
+        except Exception as exc:  # boto3 import / client construction
+            for label, name in table_names.items():
+                tables[label] = {
+                    "table": name,
+                    "reachable": False,
+                    "error": str(exc),
+                }
+        try:
+            s3_client = boto3.client("s3", **client_kwargs)
+            s3_client.head_bucket(Bucket=bucket)
+            s3["reachable"] = True
+        except Exception as exc:
+            s3["reachable"] = False
+            s3["error"] = str(exc)
+
+    return jsonify({
+        "storage": info,
+        "tables": tables,
+        "s3": s3,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 @app.errorhandler(404)

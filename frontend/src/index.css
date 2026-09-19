@@ -2,7 +2,257 @@
 @tailwind components;
 @tailwind utilities;
 
-/* App-wide tweaks on top of Tailwind */
-body {
-  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+/* ============================================================
+   Outlay — Liquid Glass Design System
+   ============================================================ */
+
+@layer base {
+  :root {
+    /* Page background is a soft, layered mesh — not a flat color. We use
+       two very faint radial gradients in indigo and warm cream tones so
+       the glass surfaces have something interesting to refract. */
+    --bg-base: 248 250 252;        /* slate-50  */
+    --bg-tint-a: 238 242 255;     /* brand-50  */
+    --bg-tint-b: 255 251 235;     /* warm cream */
+
+    --ink-900: 15 23 42;
+    --ink-700: 51 65 85;
+    --ink-500: 100 116 139;
+
+    --brand-600: 79 70 229;
+    --brand-500: 99 102 241;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-feature-settings: "cv11", "ss01", "ss03";
+    color: rgb(var(--ink-900));
+    background-color: rgb(var(--bg-base));
+    /* Layered radial mesh: two faint color tints + a base wash. This is
+       what the glass surfaces will refract. The mesh is fixed to the
+       viewport so it doesn't scroll. */
+    background-image:
+      radial-gradient(60% 80% at 12% 0%, rgba(var(--bg-tint-a) / 0.85) 0%, rgba(var(--bg-tint-a) / 0) 60%),
+      radial-gradient(50% 70% at 100% 10%, rgba(var(--bg-tint-b) / 0.7) 0%, rgba(var(--bg-tint-b) / 0) 55%),
+      radial-gradient(80% 100% at 50% 100%, rgba(var(--bg-tint-a) / 0.45) 0%, rgba(var(--bg-tint-a) / 0) 70%);
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+    min-height: 100vh;
+  }
+
+  /* Stronger headings, tighter tracking for the premium look. */
+  h1, h2, h3, h4 {
+    letter-spacing: -0.018em;
+  }
+}
+
+@layer components {
+  /* ----------------------------------------------------------------
+     Glass surface primitives.
+     One rule, used everywhere — keeps the visual language consistent.
+     ---------------------------------------------------------------- */
+
+  /* Base glass — used for cards, panels, dropdown menus. */
+  .glass {
+    background-color: rgba(255, 255, 255, 0.62);
+    backdrop-filter: blur(16px) saturate(140%);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.6);
+    box-shadow:
+      0 2px 6px rgba(15, 23, 42, 0.05),
+      0 12px 32px rgba(15, 23, 42, 0.07),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.65),
+      inset 0 -1px 0 0 rgba(15, 23, 42, 0.03);
+  }
+
+  /* Strong glass — used on the sticky header and modals where we need
+     extra contrast against the page behind. */
+  .glass-strong {
+    background-color: rgba(255, 255, 255, 0.78);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    border: 1px solid rgba(255, 255, 255, 0.7);
+    box-shadow:
+      0 2px 6px rgba(15, 23, 42, 0.06),
+      0 12px 36px rgba(15, 23, 42, 0.09),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.75),
+      inset 0 -1px 0 0 rgba(15, 23, 42, 0.04);
+  }
+
+  /* Subtle glass — for inline elements like chips, badges, small inset
+     panels where a heavy blur would be overkill. */
+  .glass-subtle {
+    background-color: rgba(255, 255, 255, 0.48);
+    backdrop-filter: blur(8px) saturate(120%);
+    -webkit-backdrop-filter: blur(8px) saturate(120%);
+    border: 1px solid rgba(255, 255, 255, 0.55);
+  }
+
+  /* Tinted glass — for accent surfaces (selection panels, active rows).
+     Uses a tiny indigo wash so the highlight is visible without being loud. */
+  .glass-tint {
+    background-color: rgba(238, 242, 255, 0.55);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.65);
+    box-shadow:
+      0 2px 6px rgba(79, 70, 229, 0.08),
+      0 8px 24px rgba(15, 23, 42, 0.06),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.7);
+  }
+
+  /* ----------------------------------------------------------------
+     Button system — 3 variants, all glass-aware.
+     ---------------------------------------------------------------- */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5
+      rounded-xl text-sm font-semibold text-white
+      bg-brand-600 shadow-brand
+      transition-all duration-200 ease-out
+      hover:bg-brand-700 hover:shadow-soft-lg hover:-translate-y-0.5
+      active:translate-y-0 active:scale-[0.98]
+      focus:outline-none focus:ring-2 focus:ring-brand-400 focus:ring-offset-2 focus:ring-offset-white/50
+      disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:translate-y-0 disabled:hover:shadow-brand;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5
+      rounded-xl text-sm font-semibold text-ink-700
+      transition-all duration-200 ease-out
+      hover:-translate-y-0.5 hover:shadow-soft
+      active:translate-y-0 active:scale-[0.98]
+      focus:outline-none focus:ring-2 focus:ring-brand-400 focus:ring-offset-2 focus:ring-offset-white/50;
+    background-color: rgba(255, 255, 255, 0.62);
+    backdrop-filter: blur(12px) saturate(140%);
+    -webkit-backdrop-filter: blur(12px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.7);
+    box-shadow:
+      0 1px 2px rgba(15, 23, 42, 0.04),
+      0 4px 12px rgba(15, 23, 42, 0.05),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.65);
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-3 py-2
+      rounded-lg text-sm font-medium text-ink-600
+      transition-all duration-200 ease-out
+      hover:bg-white/60 hover:text-ink-900 hover:shadow-soft-sm
+      active:scale-[0.98]
+      focus:outline-none focus:ring-2 focus:ring-brand-400 focus:ring-offset-1 focus:ring-offset-white/40;
+  }
+
+  /* ----------------------------------------------------------------
+     Inputs — glassy, with a soft inset on focus.
+     ---------------------------------------------------------------- */
+  .input-glass {
+    @apply w-full px-3.5 py-2.5 rounded-xl text-sm text-ink-900
+      placeholder:text-ink-400
+      transition-all duration-200 ease-out
+      focus:outline-none focus:ring-2 focus:ring-brand-400/60 focus:ring-offset-1;
+    background-color: rgba(255, 255, 255, 0.72);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(226, 232, 240, 0.9);
+    box-shadow:
+      0 1px 2px rgba(15, 23, 42, 0.04),
+      inset 0 1px 2px rgba(15, 23, 42, 0.04);
+  }
+  .input-glass:focus {
+    background-color: rgba(255, 255, 255, 0.92);
+    border-color: rgba(99, 102, 241, 0.5);
+    box-shadow:
+      0 0 0 4px rgba(99, 102, 241, 0.12),
+      0 1px 2px rgba(15, 23, 42, 0.05),
+      inset 0 1px 2px rgba(15, 23, 42, 0.03);
+  }
+
+  /* Selects inherit the glass input look but get a custom chevron. */
+  .select-glass {
+    @apply input-glass appearance-none pr-9 cursor-pointer;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%2364748b' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><path d='M6 8l4 4 4-4'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    background-size: 1rem;
+  }
+
+  /* Native month picker — tone down the browser chrome. */
+  input[type="month"].input-glass {
+    @apply pr-3;
+  }
+  input[type="month"]::-webkit-calendar-picker-indicator {
+    opacity: 0.55;
+    cursor: pointer;
+    filter: invert(0.35);
+  }
+
+  /* ----------------------------------------------------------------
+     Pills / chips / status badges
+     ---------------------------------------------------------------- */
+  .chip {
+    @apply inline-flex items-center gap-1 px-2.5 py-1
+      rounded-full text-xs font-medium capitalize;
+  }
+
+  /* ----------------------------------------------------------------
+     Section labels — small all-caps eyebrows above headings
+     ---------------------------------------------------------------- */
+  .eyebrow {
+    @apply text-xs font-semibold uppercase tracking-[0.16em] text-brand-600;
+  }
+}
+
+@layer utilities {
+  /* Subtle shimmer skeleton for loading states. */
+  .skeleton {
+    background: linear-gradient(
+      90deg,
+      rgba(226, 232, 240, 0.4) 0%,
+      rgba(241, 245, 249, 0.85) 50%,
+      rgba(226, 232, 240, 0.4) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.6s linear infinite;
+  }
+
+  /* Hide scrollbar but keep scroll. */
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+  /* Premium focus ring — used on non-control elements (cards, links). */
+  .focus-ring {
+    @apply focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-400/60 focus-visible:ring-offset-2 focus-visible:ring-offset-white/40;
+  }
+}
+
+/* Recharts overrides — the default white background and dark borders
+   clash with the glass surface. Tone them down. */
+.recharts-default-tooltip {
+  background-color: rgba(255, 255, 255, 0.85) !important;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.7) !important;
+  border-radius: 0.75rem !important;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08) !important;
+  padding: 8px 12px !important;
+}
+.recharts-tooltip-label {
+  color: rgb(15 23 42) !important;
+  font-weight: 600 !important;
+  font-size: 12px !important;
+}
+.recharts-tooltip-item {
+  color: rgb(51 65 85) !important;
+  font-size: 12px !important;
+}
+.recharts-legend-item-text {
+  color: rgb(71 85 105) !important;
+  font-size: 13px !important;
 }

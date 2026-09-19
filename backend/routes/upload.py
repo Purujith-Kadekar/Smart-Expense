@@ -25,6 +25,7 @@ Protected by `@require_auth`.
 """
 
 import os
+import sys
 import uuid
 from datetime import datetime, timezone
 
@@ -37,6 +38,36 @@ from services.s3 import generate_presigned_upload, object_exists
 upload_bp = Blueprint("upload", __name__)
 
 VALID_CATEGORIES = {"college", "mess", "event", "other"}
+
+
+def _import_lambda_function():
+    """Import lambda/lambda_function.py, wherever it lives.
+
+    In docker-compose the Dockerfile puts the lambda package at /lambda and
+    adds it to PYTHONPATH, so a plain import works. When the backend runs
+    from the repo on the host (`python app.py`) nothing puts lambda/ on
+    sys.path — this function resolves it relative to this file:
+    routes/ -> backend/ -> project root -> lambda/.
+
+    The previous version hard-coded sys.path.insert(0, "/lambda"), which
+    only exists inside the container — on the host every trigger-ocr call
+    died with "No module named lambda_function" (HTTP 500), so receipts
+    were uploaded to S3 but never turned into expense records.
+    """
+    try:
+        import lambda_function  # noqa: F401  (already importable — Docker case)
+        return lambda_function
+    except ImportError:
+        pass
+
+    root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    lambda_dir = os.path.join(root, "lambda")
+    if lambda_dir not in sys.path:
+        sys.path.insert(0, lambda_dir)
+    import lambda_function
+    return lambda_function
 
 
 @upload_bp.post("/upload-url")
@@ -91,20 +122,15 @@ def trigger_ocr():
     if len(parts) < 4 or parts[0] != "receipts" or parts[1] != request.user_id:
         return jsonify({"error": "s3_key_does_not_belong_to_caller"}), 403
 
-    # In real AWS mode (no MOCK_AWS, no AWS_ENDPOINT_URL pointing at
-    # LocalStack), S3 triggers Lambda automatically — no-op here.
+    # Ingestion ALWAYS runs in-process in this project — there is no deployed
+    # S3→Lambda trigger anywhere (docker-compose invokes the handler directly
+    # because LocalStack Community's S3 notifications are unreliable, and in
+    # real-AWS mode the same in-process call writes to real DynamoDB/S3 via
+    # boto3). This used to return 503 aws_endpoint_url_not_set when
+    # AWS_ENDPOINT_URL was unset, which silently made real-DynamoDB mode
+    # unusable: uploads stored fine but no expense record ever appeared.
     if not is_mock_mode() and not os.environ.get("AWS_ENDPOINT_URL"):
-        # This project never talks to real AWS, so reaching here means a
-        # misconfiguration, not a deployment mode. Say so loudly: silently
-        # returning triggered=False is how you end up staring at an empty
-        # dashboard wondering why OCR "ran" but produced nothing.
-        return jsonify({
-            "error": "aws_endpoint_url_not_set",
-            "hint": "AWS_ENDPOINT_URL is unset, so boto3 would target real "
-                    "AWS. Set AWS_ENDPOINT_URL=http://localstack:4566 "
-                    "(in a container) or http://localhost:4566 (on the "
-                    "host). docker-compose.yml sets this for you.",
-        }), 503
+        print("[upload] AWS_ENDPOINT_URL unset — ingesting in-process against real AWS")
 
     bucket = os.environ.get("S3_BUCKET", "receipts-bucket")
 
@@ -122,13 +148,11 @@ def trigger_ocr():
         }), 404
 
     # Build a synthetic S3 event and invoke the Lambda handler directly.
-    # We import lazily so the backend doesn't require the lambda package at
-    # import time (the test suite patches these out).
-    import sys
-    if "/lambda" not in sys.path:
-        sys.path.insert(0, "/lambda")
+    # _import_lambda_function() resolves the lambda package both inside
+    # Docker (/lambda on PYTHONPATH) and on a host checkout — see its
+    # docstring for why this used to be the #1 host-mode upload failure.
     try:
-        import lambda_function
+        lambda_function = _import_lambda_function()
         from services import mock_aws as _mock_aws
 
         # Point the Lambda's boto3 clients at the same mock/localstack

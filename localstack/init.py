@@ -13,9 +13,18 @@ Region is us-east-1 throughout. That matters for the bucket: us-east-1 is
 the only region where CreateBucket must NOT be given a
 CreateBucketConfiguration.LocationConstraint. Passing one raises
 InvalidLocationConstraint — which is exactly what happens if you copy a
-create_bucket call written for another region.
+create_bucket call written for another region. (Outside us-east-1, set
+AWS_REGION: the code below adds the LocationConstraint when needed.)
+
+Usage:
+  python init.py           — create resources in LocalStack (default)
+  python init.py --aws     — create resources in REAL AWS (durable storage:
+                             accounts, budgets and receipts survive
+                             restarts; DynamoDB free tier covers this).
+                             Requires `aws configure` credentials.
 """
 
+import argparse
 import json
 import os
 import sys
@@ -68,7 +77,15 @@ def wait_for_localstack(timeout=90):
     return False
 
 
-def _s3_client():
+def _s3_client(use_aws=False):
+    """S3 client for the chosen target.
+
+    LocalStack: SigV4 + path-style (virtual-host style would build
+    receipts-bucket.localhost:4566, which resolves nowhere).
+    Real AWS: default addressing (virtual-host style is the standard there).
+    """
+    if use_aws:
+        return boto3.client("s3", region_name=REGION)
     return boto3.client(
         "s3",
         endpoint_url=LOCALSTACK_ENDPOINT,
@@ -83,7 +100,13 @@ def create_bucket(s3):
     us-east-1 takes no LocationConstraint — see the module docstring.
     """
     try:
-        s3.create_bucket(Bucket=BUCKET)
+        if REGION == "us-east-1":
+            s3.create_bucket(Bucket=BUCKET)
+        else:
+            s3.create_bucket(
+                Bucket=BUCKET,
+                CreateBucketConfiguration={"LocationConstraint": REGION},
+            )
         print(f"[init] Created S3 bucket: {BUCKET}")
     except s3.exceptions.BucketAlreadyOwnedByYou:
         print(f"[init] S3 bucket {BUCKET} already exists — skipping")
@@ -174,7 +197,7 @@ def create_topic(sns):
         sns.subscribe(
             TopicArn=arn,
             Protocol="email",
-            Endpoint=os.environ.get("ALERT_EMAIL", "finance-office@campus.local"),
+            Endpoint=os.environ.get("ALERT_EMAIL", "alerts@outlay.local"),
         )
         print("[init] Subscribed a demo email endpoint to ExpenseAlerts")
     except Exception as exc:
@@ -183,12 +206,31 @@ def create_topic(sns):
 
 
 def main():
-    if not wait_for_localstack():
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Create the Outlay AWS resources (bucket, tables, topic)."
+    )
+    parser.add_argument(
+        "--aws",
+        action="store_true",
+        help="create the resources in REAL AWS instead of LocalStack — durable "
+             "storage for accounts/budgets/receipts (uses your `aws configure` "
+             "credentials; DynamoDB + S3 free tiers cover this usage)",
+    )
+    args = parser.parse_args()
 
-    s3 = _s3_client()
-    dynamo = boto3.client("dynamodb", endpoint_url=LOCALSTACK_ENDPOINT, region_name=REGION)
-    sns = boto3.client("sns", endpoint_url=LOCALSTACK_ENDPOINT, region_name=REGION)
+    if args.aws:
+        print("[init] --aws mode: creating resources in REAL AWS")
+        print(f"[init] Region: {REGION}")
+        print("[init] Make sure `aws configure` has run — real credentials are used.")
+        s3 = _s3_client(use_aws=True)
+        dynamo = boto3.client("dynamodb", region_name=REGION)
+        sns = boto3.client("sns", region_name=REGION)
+    else:
+        if not wait_for_localstack():
+            sys.exit(1)
+        s3 = _s3_client()
+        dynamo = boto3.client("dynamodb", endpoint_url=LOCALSTACK_ENDPOINT, region_name=REGION)
+        sns = boto3.client("sns", endpoint_url=LOCALSTACK_ENDPOINT, region_name=REGION)
 
     create_bucket(s3)
     create_tables(dynamo)
@@ -198,7 +240,12 @@ def main():
     print(f"[init] Bucket:  {BUCKET}")
     print(f"[init] Tables:  {EXPENSES_TABLE}, {USERS_TABLE}, {BUDGETS_TABLE}")
     print(f"[init] Topic:   {arn}")
-    print("[init] Setup complete. Register an account at http://localhost:5173")
+    if args.aws:
+        print("[init] REAL AWS mode — then point the backend at it:")
+        print("[init]   backend/.env: comment out AWS_ENDPOINT_URL and")
+        print("[init]   AWS_PUBLIC_ENDPOINT_URL, and set MOCK_AWS=0")
+    else:
+        print("[init] Setup complete. Register an account at http://localhost:5173")
     print("[init] ------------------------------------------------------")
 
 

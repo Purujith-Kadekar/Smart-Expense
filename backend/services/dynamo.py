@@ -158,7 +158,7 @@ def list_expenses_by_event(user_id, event_name):
     Implemented as a filtered scan rather than a Query. The previous version
     queried an `event_name-index` GSI that was never created by
     localstack/init.py, so any call raised ValidationException. A scan needs
-    no index and is correct at campus-demo scale.
+    no index and is correct at demo scale.
     """
     return [i for i in list_expenses(user_id=user_id) if i.get("event_name") == event_name]
 
@@ -178,7 +178,7 @@ def get_user_by_email(email):
     """Look up a user by email.
 
     Email is not the partition key, so this scans and filters — fine for a
-    handful of campus accounts. Production would add a GSI on `email`.
+    handful of accounts. Production would add a GSI on `email`.
     """
     if email is None:
         return None

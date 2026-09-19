@@ -131,7 +131,7 @@ def email_receipts_as_bill():
     html_body = _build_bill_html(fetched, total, description, request.user_id)
     text_body = _build_bill_text(fetched, total, description)
 
-    subject = f"Expense bill — {description}" if description else "Expense bill"
+    subject = f"Outlay bill — {description}" if description else "Outlay bill"
 
     # --- Send via SES (or mock) ---
     try:
@@ -152,12 +152,41 @@ def email_receipts_as_bill():
     })
 
 
-def _fmt_amount(n):
-    """Format a number as ₹X,XXX.XX — consistent with the frontend."""
+def _fmt_amount(n, currency="INR"):
+    """Format a number with the given currency's symbol — used for the
+    ORIGINAL amount annotation on foreign-currency receipts."""
+    symbols = {"INR": "₹", "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥"}
+    symbol = symbols.get((currency or "INR").upper(), (currency or "₹"))
     try:
-        return f"₹{float(n):,.2f}"
+        return f"{symbol}{float(n):,.2f}"
     except (TypeError, ValueError):
-        return "₹0.00"
+        return f"{symbol}0.00"
+
+
+def _fmt_row_amount(item):
+    """Render a receipt row's amount for the email bill — always INR.
+
+    `item['amount']` is the frozen INR value written at ingest time. When
+    the receipt was in a foreign currency we append the original so the
+    recipient can audit the conversion:  "₹404.60  ($4.86 @ 83.25)".
+    Legacy rows without fx fields just show the INR amount.
+    """
+    try:
+        inr = float(item.get("amount", 0))
+    except (TypeError, ValueError):
+        inr = 0.0
+    text = f"₹{inr:,.2f}"
+    currency = (item.get("currency") or "INR").upper()
+    original = item.get("original_amount")
+    rate = item.get("fx_rate")
+    if currency != "INR" and original is not None:
+        try:
+            original = float(original)
+            rate_txt = f" @ {float(rate):,.2f}" if rate is not None else ""
+            text += f"  ({_fmt_amount(original, currency)}{rate_txt})"
+        except (TypeError, ValueError):
+            pass
+    return text
 
 
 def _build_bill_html(items, total, description, user_id):
@@ -171,7 +200,7 @@ def _build_bill_html(items, total, description, user_id):
             f"<td style='padding:6px 12px;border-bottom:1px solid #e5e7eb;'>{escape(str(item.get('vendor') or '—'))}</td>"
             f"<td style='padding:6px 12px;border-bottom:1px solid #e5e7eb;'>{escape(str(item.get('date') or '—'))}</td>"
             f"<td style='padding:6px 12px;border-bottom:1px solid #e5e7eb;'>{escape(str(item.get('category') or '—'))}</td>"
-            f"<td style='padding:6px 12px;border-bottom:1px solid #e5e7eb;text-align:right;'>{_fmt_amount(item.get('amount', 0))}</td>"
+            f"<td style='padding:6px 12px;border-bottom:1px solid #e5e7eb;text-align:right;'>{_fmt_row_amount(item)}</td>"
             f"</tr>"
         )
     rows_html = "\n".join(rows)
@@ -181,7 +210,7 @@ def _build_bill_html(items, total, description, user_id):
 
     return f"""\
 <div style='font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;'>
-  <h2 style='color:#0f172a;margin-bottom:4px;'>Expense Bill</h2>
+  <h2 style='color:#0f172a;margin-bottom:4px;'>Outlay Bill</h2>
   {desc_html}
   <table style='width:100%;border-collapse:collapse;margin:16px 0;font-size:14px;'>
     <thead>
@@ -190,7 +219,7 @@ def _build_bill_html(items, total, description, user_id):
         <th style='padding:8px 12px;text-align:left;border-bottom:2px solid #e5e7eb;'>Vendor</th>
         <th style='padding:8px 12px;text-align:left;border-bottom:2px solid #e5e7eb;'>Date</th>
         <th style='padding:8px 12px;text-align:left;border-bottom:2px solid #e5e7eb;'>Category</th>
-        <th style='padding:8px 12px;text-align:right;border-bottom:2px solid #e5e7eb;'>Amount</th>
+        <th style='padding:8px 12px;text-align:right;border-bottom:2px solid #e5e7eb;'>Amount (INR)</th>
       </tr>
     </thead>
     <tbody>
@@ -215,13 +244,14 @@ def _build_bill_text(items, total, description):
     if description:
         lines.append(description)
         lines.append("")
-    lines.append(f"{'Vendor':<30} {'Date':<12} {'Category':<10} {'Amount':>12}")
-    lines.append("-" * 70)
+    lines.append(f"{'Vendor':<30} {'Date':<12} {'Category':<10} {'Amount (INR)':>26}")
+    lines.append("-" * 84)
     for item in items:
         vendor = (str(item.get("vendor") or "—"))[:28]
         date = str(item.get("date") or "—")[:12]
         category = str(item.get("category") or "—")[:10]
-        lines.append(f"{vendor:<30} {date:<12} {category:<10} {_fmt_amount(item.get('amount', 0)):>12}")
-    lines.append("-" * 70)
-    lines.append(f"{'Total':<54} {_fmt_amount(total):>12}")
+        amt = _fmt_row_amount(item)[:26]
+        lines.append(f"{vendor:<30} {date:<12} {category:<10} {amt:>26}")
+    lines.append("-" * 84)
+    lines.append(f"{'Total':<68} {_fmt_amount(total):>14}")
     return "\n".join(lines)

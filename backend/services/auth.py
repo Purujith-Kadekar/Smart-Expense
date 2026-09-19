@@ -22,7 +22,11 @@ from flask import jsonify, request
 # Read config at import time. In production these MUST come from env:
 #   JWT_SECRET=<random 64-char hex string>
 # For local dev, a fixed default lets `python app.py` work zero-config.
-JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production-do-not-use-in-prod")
+# An EMPTY JWT_SECRET (the .env.example placeholder) is treated as unset —
+# PyJWT would otherwise happily sign every token with an empty HMAC key,
+# which is trivially forgeable.
+JWT_SECRET = (os.environ.get("JWT_SECRET") or "").strip() or \
+    "dev-secret-change-in-production-do-not-use-in-prod"
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", "24"))
 

@@ -1,5 +1,5 @@
 """
-Smart Campus Expense & Invoice Verifier — ingestion Lambda
+Outlay — ingestion Lambda
 
 Triggered by an S3 ObjectCreated event (or invoked directly by the Flask
 backend in LocalStack mode, which is how the docker-compose stack works —
@@ -9,9 +9,14 @@ Pipeline:
   1. Download the receipt image from S3 (`receipts-bucket`).
   2. Run OCR locally via EasyOCR or Tesseract — see lambda/ocr_engine.py.
      No AWS Textract, no Rekognition, no paid API, no network at inference.
-  3. Parse vendor / amount / date from the raw OCR text (lambda/parse_ocr.py).
-  4. Write a structured record to DynamoDB (`ExpenseRecords`).
-  5. Publish to SNS (`ExpenseAlerts`) when the amount breaches BUDGET_LIMIT
+  3. Parse vendor / amount / date / currency from the raw OCR text
+     (lambda/parse_ocr.py).
+  4. Convert the amount to INR using the LIVE exchange rate at upload
+     time (lambda/fx.py), then FREEZE it: the record keeps the original
+     amount + currency + the rate used, and the stored `amount` is the
+     INR value. It is never re-converted when rates move later.
+  5. Write a structured record to DynamoDB (`ExpenseRecords`).
+  6. Publish to SNS (`ExpenseAlerts`) when the amount breaches BUDGET_LIMIT
      or the receipt is flagged as a duplicate.
 
 Environment variables:
@@ -36,6 +41,7 @@ from decimal import Decimal
 import boto3
 
 from parse_ocr import parse_ocr_text, parse_s3_key
+from fx import convert_to_inr
 import ocr_engine
 
 # LocalStack always reports this as the account id. Used to synthesise a
@@ -140,17 +146,11 @@ def run_ocr(image_path):
     return ocr_engine.run_ocr(image_path)
 
 
-def _is_duplicate(table, user_id, vendor, amount, date_str, exclude_id=None):
-    """Flag a receipt as a duplicate of one already recorded for this user.
+def _scan_all_items(table):
+    """Scan the full table (following pagination), returning a list of items.
 
-    Definition of a duplicate: same user, same vendor, same amount, same
-    date. Receipts genuinely can repeat (two coffees on one day), so this
-    is a soft flag for review, not a hard reject — the record is still
-    written and still shown on the dashboard.
-
-    Scans the table and filters client-side. At campus-demo scale (tens to
-    hundreds of records) that is sub-100ms; a production build would add a
-    GSI on user_id and Query instead.
+    Shared by the duplicate check and the s3_key idempotency check so we
+    only pay for one scan per invocation.
     """
     try:
         response = table.scan()
@@ -158,10 +158,30 @@ def _is_duplicate(table, user_id, vendor, amount, date_str, exclude_id=None):
         while "LastEvaluatedKey" in response:
             response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
             items.extend(response.get("Items", []))
+        return items
     except Exception as exc:
-        print(f"[ingest] Duplicate check skipped (scan failed): {exc}")
-        return False
+        print(f"[ingest] Table scan failed: {exc}")
+        return []
 
+
+def _is_duplicate(items, user_id, vendor, amount, date_str, currency="INR", exclude_id=None):
+    """Flag a receipt as a duplicate of one already recorded for this user.
+
+    Definition of a duplicate: same user, same vendor, same ORIGINAL
+    amount (as printed on the receipt), same currency, same date. We
+    compare the original amount, not the INR value, so the same foreign
+    receipt re-uploaded on a different day (when the live rate has moved)
+    is still recognised as a duplicate. Legacy records written before FX
+    conversion existed have no `original_amount` — they fall back to their
+    stored `amount` (which was pre-INR-freeze semantics).
+
+    Receipts genuinely can repeat (two coffees on one day), so this is a
+    soft flag for review, not a hard reject — the record is still written
+    and still shown on the dashboard.
+
+    Takes the pre-scanned item list so the single scan is shared with the
+    s3_key idempotency lookup.
+    """
     for item in items:
         if exclude_id is not None and item.get("expense_id") == exclude_id:
             continue
@@ -171,12 +191,43 @@ def _is_duplicate(table, user_id, vendor, amount, date_str, exclude_id=None):
             continue
         if (item.get("date") or "") != (date_str or ""):
             continue
+        if (item.get("currency") or "INR") != (currency or "INR"):
+            continue
         try:
-            if abs(float(item.get("amount", 0)) - float(amount)) < 0.005:
+            prior = float(item.get("original_amount", item.get("amount", 0)))
+            if abs(prior - float(amount)) < 0.005:
                 return True
         except (TypeError, ValueError):
             continue
     return False
+
+
+def _find_by_s3_key(items, user_id, s3_key):
+    """Return the existing record for this (user, s3_key), or None.
+
+    Idempotency guard: the Flask trigger-ocr endpoint (and a real S3 event
+    retry, or an S3+manual double trigger) can fire twice for the same
+    upload. Without this check each trigger wrote a fresh expense_id and
+    the dashboard double-counted the receipt in every total.
+    """
+    for item in items:
+        if item.get("user_id") != user_id:
+            continue
+        if item.get("s3_key") == s3_key:
+            return item
+    return None
+
+
+def _jsonable(item):
+    """Convert a DynamoDB item (Decimal amounts) into a JSON-safe dict."""
+    out = dict(item)
+    for key in ("amount", "original_amount", "fx_rate"):
+        if key in out:
+            try:
+                out[key] = float(out[key])
+            except (TypeError, ValueError):
+                pass
+    return out
 
 
 def lambda_handler(event, context):
@@ -228,21 +279,59 @@ def lambda_handler(event, context):
         print(f"[ingest] OCR failed: {exc}")
         ocr_text = ""
 
-    # ---- 4. Parse vendor / amount / date ----
+    # ---- 4. Parse vendor / amount / date / currency ----
     parsed = parse_ocr_text(ocr_text)
     vendor = parsed.get("vendor") or "Unknown"
-    amount = float(parsed.get("amount") or 0.0)
+    original_amount = float(parsed.get("amount") or 0.0)
     date_str = parsed.get("date") or datetime.now(timezone.utc).date().isoformat()
+    currency = parsed.get("currency") or "INR"
 
-    print(f"[ingest] Parsed: vendor={vendor!r} amount={amount} date={date_str}")
+    print(
+        f"[ingest] Parsed: vendor={vendor!r} amount={original_amount} "
+        f"date={date_str} currency={currency}"
+    )
+
+    # ---- 4a. Convert to INR ONCE, using the live rate at upload time ----
+    # The stored `amount` is ALWAYS the INR value, so every downstream total
+    # (budget status, income vs spent, category breakdown, email bills) is
+    # automatically in rupees. The original amount + rate are frozen onto
+    # the record for audit/display and are NEVER re-applied — if USD/INR
+    # moves tomorrow, this receipt keeps today's rate.
+    fx = convert_to_inr(original_amount, currency)
+    amount = fx["amount_inr"]
+    if fx["source"] == "native":
+        print(f"[ingest] INR receipt — no conversion needed (₹{amount})")
+    else:
+        print(
+            f"[ingest] Converted {fx['original_amount']} {fx['currency']} -> "
+            f"INR {amount} @ {fx['rate']} (source={fx['source']}, frozen at upload)"
+        )
 
     if dynamodb is None:
         dynamodb = _make_resource("dynamodb")
     table = dynamodb.Table(TABLE_NAME)
 
+    # ---- 4b. Idempotency: an S3 event retry or a re-trigger of the same
+    # key must NOT create a second expense record. If we already ingested
+    # this exact s3_key for this user, return the existing record instead
+    # of re-running OCR + writing a duplicate row (which double-counted in
+    # every dashboard total). ----
+    existing_items = _scan_all_items(table)
+    existing = _find_by_s3_key(existing_items, user_id, key)
+    if existing is not None:
+        print(f"[ingest] s3_key already ingested as expense_id={existing.get('expense_id')} — returning existing record")
+        return {
+            "statusCode": 200,
+            "body": json.dumps(_jsonable(existing)),
+        }
+
     # ---- 5. Anomaly detection ----
+    # BUDGET_LIMIT is in INR, and `amount` is the INR value — apples to
+    # apples even for foreign-currency receipts.
     over_budget = bool(amount > BUDGET_LIMIT)
-    duplicate = _is_duplicate(table, user_id, vendor, amount, date_str)
+    duplicate = _is_duplicate(
+        existing_items, user_id, vendor, original_amount, date_str, currency
+    )
     flags = []
     if over_budget:
         flags.append("over_budget")
@@ -252,10 +341,18 @@ def lambda_handler(event, context):
     expense_record = {
         "expense_id": str(uuid.uuid4()),
         "user_id": user_id,
-        "category": category,
+        "category": category or "other",
         "event_name": "unassigned",
         "vendor": vendor,
+        # `amount` is the frozen INR value — the number every dashboard
+        # total sums. See the conversion step above.
         "amount": amount,
+        # Audit trail for the conversion (what the receipt actually said).
+        "currency": fx["currency"],
+        "original_amount": fx["original_amount"],
+        "fx_rate": fx["rate"],
+        "fx_source": fx["source"],
+        "fx_fetched_at": fx["fetched_at"],
         "date": date_str,
         "s3_key": key,
         "over_budget": over_budget,
@@ -268,11 +365,12 @@ def lambda_handler(event, context):
     # ---- 6. Persist to DynamoDB ----
     # DynamoDB's Number type requires Decimal — put_item on a float raises
     # "Float types are not supported". We write a Decimal-typed copy and keep
-    # the float in expense_record so the HTTP response and the SNS message
+    # the floats in expense_record so the HTTP response and the SNS message
     # JSON-serialise cleanly (Decimal is not JSON-native).
     try:
         record_for_dynamo = dict(expense_record)
-        record_for_dynamo["amount"] = Decimal(str(amount))
+        for key_ in ("amount", "original_amount", "fx_rate"):
+            record_for_dynamo[key_] = Decimal(str(record_for_dynamo[key_]))
         table.put_item(Item=record_for_dynamo)
         print(f"[ingest] Wrote expense_id={expense_record['expense_id']} to {TABLE_NAME}")
     except Exception as exc:
