@@ -1,0 +1,16 @@
+# Don't send these to the Docker build context — keeps builds fast.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.local
+*.egg-info/
+dist/
+build/
+node_modules/
+.git/
+.gitignore
+*.md

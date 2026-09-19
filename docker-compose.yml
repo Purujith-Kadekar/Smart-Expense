@@ -1,0 +1,134 @@
+# Smart Campus Expense & Invoice Verifier — full local stack.
+#
+#   docker-compose up --build
+#   open http://localhost:5173
+#
+# Nothing here touches real AWS. LocalStack stands in for S3, DynamoDB, SNS
+# and SES; credentials are the dummy "test"/"test" pair LocalStack expects.
+#
+# First build takes 5-10 minutes and produces a ~2 GB backend image, because
+# EasyOCR pulls in CPU PyTorch and its model weights are baked in at build
+# time so the running container needs no network. Set OCR_ENGINE=tesseract
+# (and see backend/Dockerfile) if you want the 300 MB image instead.
+
+services:
+  # --- LocalStack: S3 + DynamoDB + SNS + SES ---
+  # 3.8.1 Community needs no auth token and works fully offline. If you ever
+  # see a token prompt, you have pulled a Pro image tag, not Community.
+  localstack:
+    image: localstack/localstack:3.8.1
+    container_name: campus-localstack
+    ports:
+      - "4566:4566"          # single edge port for every service
+    environment:
+      - SERVICES=s3,dynamodb,sns,ses
+      - DEBUG=0
+      - AWS_DEFAULT_REGION=us-east-1
+      - PERSISTENCE=0
+      # No DOCKER_HOST / docker.sock mount: we never ask LocalStack to spawn
+      # a Lambda container. The backend imports and calls the handler in
+      # process, which is faster and removes the socket mount entirely.
+    volumes:
+      - localstack-data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # --- One-shot: create bucket + tables + SNS topic, then exit ---
+  localstack-init:
+    image: python:3.11-slim
+    container_name: campus-localstack-init
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      - LOCALSTACK_ENDPOINT=http://localstack:4566
+      - AWS_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - S3_BUCKET=receipts-bucket
+      - TABLE_NAME=ExpenseRecords
+      - USERS_TABLE_NAME=Users
+      - BUDGETS_TABLE_NAME=Budgets
+      - SNS_TOPIC_NAME=ExpenseAlerts
+    volumes:
+      - ./localstack:/work
+    working_dir: /work
+    command: >
+      bash -c "pip install --quiet --no-cache-dir -r requirements.txt && python init.py"
+    restart: "no"
+
+  # --- Backend: Flask API + local OCR + the Lambda handler ---
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        # easyocr (default, accurate, big) | tesseract (fast, small)
+        OCR_ENGINE: easyocr
+    container_name: campus-backend
+    depends_on:
+      localstack:
+        condition: service_healthy
+      localstack-init:
+        condition: service_completed_successfully
+    ports:
+      - "5000:5000"
+    environment:
+      # Backend -> LocalStack, over the compose network.
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      # Browser -> LocalStack, from the host. Used ONLY to sign presigned
+      # URLs. The browser cannot resolve the hostname "localstack", and a
+      # SigV4 signature covers the Host header, so the signing client must
+      # point at the address the browser will actually call.
+      - AWS_PUBLIC_ENDPOINT_URL=http://localhost:4566
+      - AWS_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+      # Dummy credentials. They must be set: without them boto3 falls back
+      # to the IMDS chain and hangs for ~5s per call trying to reach
+      # 169.254.169.254.
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      # Must match what localstack-init creates.
+      - S3_BUCKET=receipts-bucket
+      - TABLE_NAME=ExpenseRecords
+      - USERS_TABLE_NAME=Users
+      - BUDGETS_TABLE_NAME=Budgets
+      # LocalStack always uses account id 000000000000.
+      - SNS_TOPIC_ARN=arn:aws:sns:us-east-1:000000000000:ExpenseAlerts
+      - OCR_ENGINE=easyocr
+      - EASYOCR_MODULE_PATH=/opt/easyocr
+      - BUDGET_LIMIT=20000
+      - JWT_SECRET=docker-compose-dev-secret-change-in-production
+      - JWT_EXPIRY_HOURS=24
+      - SES_VERIFIED_SENDER=noreply@campus.local
+      - ALLOWED_ORIGINS=http://localhost:5173,http://localhost:4566
+      # MOCK_AWS is deliberately unset: real boto3 calls, aimed at LocalStack.
+      - FLASK_DEBUG=0
+      - PORT=5000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # Generous: the first request loads the EasyOCR models into memory.
+      start_period: 40s
+
+  # --- Frontend: React build served by nginx ---
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: campus-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "5173:80"
+
+volumes:
+  localstack-data:
