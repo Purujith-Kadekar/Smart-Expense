@@ -27,6 +27,13 @@ from services.mock_aws import get_dynamo_resource
 _TABLE_NAME = os.environ.get("TABLE_NAME", "ExpenseRecords")
 _USERS_TABLE_NAME = os.environ.get("USERS_TABLE_NAME", "Users")
 _BUDGETS_TABLE_NAME = os.environ.get("BUDGETS_TABLE_NAME", "Budgets")
+# New: fingerprint table for cross-receipt duplicate detection. Keyed by
+# the SHA-256 file hash (string) — exact-match lookup is a get_item, and
+# the perceptual-hash lookup is a scan (fine at demo scale, GSI on a
+# phash bucket at any real scale).
+_FINGERPRINTS_TABLE_NAME = os.environ.get(
+    "FINGERPRINTS_TABLE_NAME", "ReceiptFingerprints"
+)
 
 # Resolve the resource once at import. In mock mode this is the in-memory
 # singleton; against LocalStack it is a real boto3 resource whose connection
@@ -35,6 +42,16 @@ _dynamo = get_dynamo_resource()
 _table = _dynamo.Table(_TABLE_NAME)
 _users_table = _dynamo.Table(_USERS_TABLE_NAME)
 _budgets_table = _dynamo.Table(_BUDGETS_TABLE_NAME)
+# Wrap the new table in a try so the backend still boots if the
+# fingerprints table hasn't been created yet (e.g. an old LocalStack
+# instance, or mock mode without a persist file). The fraud pipeline
+# tolerates a None table — it just skips cross-receipt duplicate
+# detection and falls back to the in-process scan.
+try:
+    _fingerprints_table = _dynamo.Table(_FINGERPRINTS_TABLE_NAME)
+except Exception as exc:  # pragma: no cover — defensive
+    print(f"[dynamo] Could not open fingerprints table {_FINGERPRINTS_TABLE_NAME!r}: {exc}")
+    _fingerprints_table = None
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +250,182 @@ def put_budget(user_id, month, budget_limit, income):
 
 
 def list_expenses_for_month(user_id, month):
-    """Return a user's expenses whose `date` (YYYY-MM-DD) falls in `month`."""
+    """Return a user's expenses whose `date` (YYYY-MM-DD) falls in `month`.
+
+    `month` of None or "all" disables the filter and returns every receipt.
+    """
     items = list_expenses(user_id=user_id)
+    if not month or month == "all":
+        return items
     return [i for i in items if (i.get("date") or "").startswith(month)]
+
+
+def list_expense_months(user_id):
+    """Return every month the user actually has receipts in.
+
+    Shape: [{"month": "2026-03", "count": 2, "total": 3647.54}, ...] sorted
+    newest month first. `month` is the YYYY-MM prefix of the receipt `date`
+    field — i.e. the date printed on the receipt, NOT the upload time.
+
+    Why this exists: the dashboard scopes every widget to the month picker,
+    which defaults to the current month. A receipt whose OCR'd date falls in
+    another month is therefore filtered out server-side and vanishes from the
+    UI with no explanation — the upload page says "processed, open the
+    Dashboard" and the Dashboard shows nothing. The record was written fine;
+    it was just never in the selected month. This endpoint lets the frontend
+    say so and offer a one-click jump instead of silently showing an empty
+    table.
+
+    Receipts with a missing / unparsable date are bucketed under "unknown"
+    so they can never disappear entirely.
+    """
+    buckets = {}
+    for item in list_expenses(user_id=user_id):
+        date_str = (item.get("date") or "").strip()
+        month = date_str[:7] if len(date_str) >= 7 else "unknown"
+        bucket = buckets.setdefault(month, {"month": month, "count": 0, "total": 0.0})
+        bucket["count"] += 1
+        try:
+            bucket["total"] += float(item.get("amount", 0))
+        except (TypeError, ValueError):
+            pass
+    for bucket in buckets.values():
+        bucket["total"] = round(bucket["total"], 2)
+    # Newest first; "unknown" sorts last.
+    return sorted(
+        buckets.values(),
+        key=lambda b: ("", "") if b["month"] == "unknown" else ("1", b["month"]),
+        reverse=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Receipt fingerprints — used by the fraud pipeline's duplicate checker.
+# Each row corresponds to one previously-ingested receipt and stores:
+#   file_hash          — SHA-256 of the original file bytes (partition key)
+#   phash              — 64-bit perceptual hash (as a Number)
+#   content_fingerprint — SHA-256 of normalized (vendor|date|amount|invoice)
+#   user_id            — owner (for per-user isolation in scans)
+#   expense_id         — link back to the ExpenseRecords row
+#   s3_key             — the S3 object key (idempotency check)
+#   created_at         — ISO timestamp
+# ---------------------------------------------------------------------------
+
+def list_receipt_fingerprints(user_id=None):
+    """Return all stored receipt fingerprints, optionally per-user.
+
+    Used by the fraud pipeline at ingest time to find candidate matches
+    for the new upload. At demo scale (≤dozens of receipts per user) a
+    scan is fine. At any real scale, add a GSI on `user_id` and switch
+    to a query.
+    """
+    if _fingerprints_table is None:
+        return []
+    try:
+        items = _to_native(_scan_all(_fingerprints_table))
+    except Exception as exc:
+        print(f"[dynamo] fingerprints scan failed: {exc}")
+        return []
+    if user_id is not None:
+        items = [i for i in items if i.get("user_id") == user_id]
+    return items
+
+
+def put_receipt_fingerprint(*, file_hash, phash, content_fingerprint,
+                             user_id, expense_id, s3_key,
+                             vendor=None, date=None, amount=None,
+                             invoice_number=None):
+    """Insert a new receipt-fingerprint row.
+
+    All arguments are keyword-only to prevent call-site arg confusion.
+    `file_hash` is the partition key; if a row already exists for the
+    same hash (i.e. exact-duplicate upload), this overwrites it with
+    the latest metadata — which is the desired behavior, because the
+    latest metadata points at the most recent expense_id, which is the
+    one a reviewer will look up.
+
+    Returns the item as written (with native numbers).
+    """
+    if _fingerprints_table is None:
+        return None
+    from datetime import datetime, timezone
+    item = {
+        "file_hash": file_hash,
+        "phash": phash,
+        "content_fingerprint": content_fingerprint,
+        "user_id": user_id,
+        "expense_id": expense_id,
+        "s3_key": s3_key,
+        "vendor": vendor,
+        "date": date,
+        "amount": amount,
+        "invoice_number": invoice_number,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        _fingerprints_table.put_item(Item=_to_dynamo(item))
+    except Exception as exc:
+        print(f"[dynamo] fingerprints put failed for {file_hash}: {exc}")
+        return None
+    return item
+
+
+def find_fingerprint_by_hash(file_hash):
+    """Return the fingerprint row with `file_hash`, or None.
+
+    Single-key lookup — this is the cheapest duplicate-detection check
+    we have. The fraud pipeline calls this first; a non-None return
+    means an exact file-hash match exists in the system."""
+    if _fingerprints_table is None or not file_hash:
+        return None
+    try:
+        resp = _fingerprints_table.get_item(Key={"file_hash": file_hash})
+        item = resp.get("Item")
+        return _to_native(item) if item else None
+    except Exception as exc:
+        print(f"[dynamo] fingerprints get failed for {file_hash}: {exc}")
+        return None
+
+
+def update_expense_fraud_result(expense_id, fraud_result, fraud_score,
+                                fraud_level):
+    """Update an existing ExpenseRecords row with the fraud analysis.
+
+    Used by the post-ingest enrichment path (when the fraud pipeline
+    runs after the Lambda's main write). The Lambda's primary write
+    path sets these fields in the same put_item that creates the
+    record — this helper exists for the case where you want to
+    refresh the fraud analysis later (e.g. after a checker is
+    improved).
+
+    `fraud_result` should be a JSON-serializable dict (the
+    `FraudResult.to_dict()` form). `fraud_score` is an int 0-100;
+    `fraud_level` is one of "VALID"/"REVIEW"/"FLAGGED".
+    """
+    from botocore.exceptions import ClientError, BotoCoreError
+    try:
+        _table.update_item(
+            Key={"expense_id": expense_id},
+            UpdateExpression=(
+                "SET fraud_result = :r, fraud_score = :s, fraud_level = :l, "
+                "fraud_analyzed_at = :t"
+            ),
+            ExpressionAttributeValues={
+                ":r": _to_dynamo(fraud_result),
+                ":s": Decimal(str(int(fraud_score))),
+                ":l": fraud_level,
+                ":t": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return True
+    except (ClientError, BotoCoreError) as exc:
+        print(f"[dynamo] update_expense_fraud_result failed for {expense_id}: {exc}")
+        return False
+    except Exception as exc:
+        print(f"[dynamo] update_expense_fraud_result (unknown) failed for {expense_id}: {exc}")
+        return False
+
+
+# Late import — `datetime` is referenced in the helpers above. Pull it
+# at module scope so callers don't trip a NameError on first call.
+from datetime import datetime, timezone  # noqa: E402

@@ -218,16 +218,78 @@ def _find_by_s3_key(items, user_id, s3_key):
     return None
 
 
+def _compute_content_fingerprint(vendor, date_str, amount, invoice_number=None):
+    """SHA-256 of normalized (vendor|date|amount|invoice) — used to
+    detect content-level duplicates (same receipt data, different image).
+
+    This is a thin wrapper around `services.fraud.hashing.content_fingerprint`
+    so the Lambda doesn't import the fraud package at module-load time
+    (the Lambda runs in its own runtime in real AWS, where the fraud
+    package may not be deployed — but in this codebase the Lambda is
+    always invoked through the Flask backend, which has the package
+    on sys.path).
+
+    Falls back to a local reimplementation if the fraud package is
+    somehow not importable. The two implementations MUST stay in
+    sync — if you change one, change the other.
+    """
+    try:
+        from services.fraud.hashing import content_fingerprint as _cf
+        return _cf(vendor, date_str, amount, invoice_number)
+    except ImportError:
+        # Local fallback — keeps the Lambda working even if the fraud
+        # package is removed. Mirrors the logic in
+        # services/fraud/hashing.py:content_fingerprint exactly.
+        import hashlib
+        import re as _re
+        v = _re.sub(r"[^a-z0-9]+", "", (vendor or "").lower().strip())
+        d = (date_str or "").strip()
+        a = f"{float(amount or 0):.2f}"
+        inv = (invoice_number or "").strip().lower()
+        raw = f"{v}|{d}|{a}|{inv}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _jsonable(item):
-    """Convert a DynamoDB item (Decimal amounts) into a JSON-safe dict."""
-    out = dict(item)
-    for key in ("amount", "original_amount", "fx_rate"):
-        if key in out:
-            try:
-                out[key] = float(out[key])
-            except (TypeError, ValueError):
-                pass
-    return out
+    """Convert a DynamoDB item (Decimal amounts, nested Decimal Maps
+    and Lists) into a JSON-safe dict.
+
+    The fraud_result field contains deeply nested Maps of check
+    outcomes, many of which carry floats (ELA mean/stddev, math
+    grand_total, etc.). When the record is written via `_to_dynamo`,
+    ALL those floats become Decimal — including the ones nested deep
+    inside fraud_result.checks.<name>.details.<key>. On read-back
+    from DynamoDB they come back as Decimal, and `json.dumps` raises
+    "Object of type Decimal is not JSON serializable".
+
+    The fix is to recursively walk the entire item and convert every
+    Decimal back to int or float. We reuse `services.dynamo._to_native`
+    which already does this — it's the symmetric counterpart of
+    `_to_dynamo` used at write time.
+    """
+    try:
+        from services.dynamo import _to_native
+        return _to_native(item)
+    except ImportError:
+        # Fallback: walk the dict manually, converting only the
+        # top-level Decimal fields we know about. This is less
+        # thorough than _to_native but keeps the Lambda working if
+        # the services.dynamo module isn't importable.
+        from decimal import Decimal as _Dec
+        out = dict(item)
+        for key in ("amount", "original_amount", "fx_rate"):
+            if key in out:
+                try:
+                    out[key] = float(out[key])
+                except (TypeError, ValueError):
+                    pass
+        for key in ("fraud_score", "phash"):
+            if key in out:
+                try:
+                    out[key] = int(out[key]) if out[key] is not None else None
+                except (TypeError, ValueError):
+                    pass
+        return out
 
 
 def lambda_handler(event, context):
@@ -338,6 +400,75 @@ def lambda_handler(event, context):
     if duplicate:
         flags.append("duplicate")
 
+    # ---- 5a. Fraud-detection pipeline ----
+    # Runs the modular checkers (hashing → duplicate → EXIF → ELA →
+    # math → logic → scoring) and produces a FraudResult that gets
+    # stored on the expense record. The checkers are tolerant of
+    # missing data — in mock mode (where download_image_from_s3
+    # returns a non-existent path and run_ocr returns "") the
+    # image-based checks skip cleanly and only the logic check (date
+    # / amount validity) runs against whatever parsed dict we got.
+    #
+    # The pipeline is wrapped in a try/except so a bug in any checker
+    # cannot fail the ingest — the receipt still gets written, with
+    # the `fraud_result` field recording which checks couldn't run.
+    # That's the right call: a broken fraud detector should not block
+    # legitimate receipts, but it should be visible in the record
+    # that the checks didn't actually run.
+    file_hash = None
+    phash = None
+    fraud_result = None
+    fraud_score = 0
+    fraud_level = "VALID"
+    try:
+        # Lazy import: the fraud package lives under services/, which is
+        # on sys.path in docker-compose (PYTHONPATH=/app:/lambda, and
+        # `services` is under `/app`) and on the host (where the backend
+        # runs from `/app` cwd). The import is *inside* the handler so
+        # the Lambda still works if the package is missing (e.g. an
+        # old build of the image) — the receipt just gets written with
+        # `fraud_result=None`.
+        from services.fraud import run_fraud_pipeline
+        from services.dynamo import (
+            list_receipt_fingerprints,
+            put_receipt_fingerprint,
+        )
+
+        existing_fingerprints = list_receipt_fingerprints(user_id=user_id)
+
+        fraud_result_obj, file_hash, phash = run_fraud_pipeline(
+            user_id=user_id,
+            s3_key=key,
+            image_path=image_path,
+            ocr_text=ocr_text,
+            parsed=parsed,
+            category=category or "other",
+            existing_items=existing_items,
+            existing_fingerprints=existing_fingerprints,
+            invoice_number=parsed.get("invoice_number"),
+        )
+        fraud_result = fraud_result_obj.to_dict()
+        fraud_score = int(fraud_result_obj.fraud_score)
+        fraud_level = fraud_result_obj.risk_level
+        print(
+            f"[ingest] Fraud pipeline: level={fraud_level} score={fraud_score} "
+            f"reasons={fraud_result_obj.reasons}"
+        )
+
+        # If the pipeline flagged the receipt as FLAGGED, also raise a
+        # SNS alert (alongside the existing over_budget/duplicate
+        # flags). REVIEW-only results don't auto-publish — they're
+        # human-triage items, not active alerts.
+        if fraud_level == "FLAGGED":
+            flags.append("fraud_flagged")
+    except Exception as exc:
+        # Log and continue — the receipt still gets written. The
+        # `fraud_result` field stays None so reviewers can see that
+        # the pipeline didn't actually run.
+        import traceback
+        print(f"[ingest] Fraud pipeline failed (non-fatal): {exc}")
+        traceback.print_exc()
+
     expense_record = {
         "expense_id": str(uuid.uuid4()),
         "user_id": user_id,
@@ -360,6 +491,24 @@ def lambda_handler(event, context):
         "flags": flags,
         "ocr_engine": ocr_engine.get_engine_name(),
         "created_at": datetime.now(timezone.utc).isoformat(),
+        # ─── Fraud-detection fields ───────────────────────────────
+        # `fraud_result` is the full structured analysis (a dict that
+        # `FraudResult.to_dict()` produces). Stored as a DynamoDB Map
+        # — no Decimal conversion needed because the score is the
+        # only number and we cast it to int below.
+        "fraud_result": fraud_result,
+        "fraud_score": fraud_score,
+        "fraud_level": fraud_level,
+        "file_hash": file_hash,
+        "phash": phash,
+        "content_fingerprint": (
+            # Computed inside the duplicate checker — recompute here
+            # for storage so future duplicate lookups (which use the
+            # fingerprints table) don't need to re-parse the OCR.
+            _compute_content_fingerprint(vendor, date_str, original_amount,
+                                          parsed.get("invoice_number"))
+            if fraud_result is not None else None
+        ),
     }
 
     # ---- 6. Persist to DynamoDB ----
@@ -367,10 +516,22 @@ def lambda_handler(event, context):
     # "Float types are not supported". We write a Decimal-typed copy and keep
     # the floats in expense_record so the HTTP response and the SNS message
     # JSON-serialise cleanly (Decimal is not JSON-native).
+    #
+    # CRITICAL: the `fraud_result` field is a nested Map containing many
+    # floats (ELA mean/stddev, math grand_total, etc.) and nested Lists of
+    # floats (ELA grid_flat). The previous version of this code only
+    # converted the top-level amount/original_amount/fx_rate floats to
+    # Decimal, leaving the nested floats in fraud_result as Python floats
+    # — which DynamoDB rejects with "Float types are not supported",
+    # causing the put_item to FAIL SILENTLY. The result: the receipt
+    # was uploaded and OCR'd successfully, but never written to the DB,
+    # so the dashboard showed nothing and the upload-page message fell
+    # back to "vendor: Unknown, amount: ₹0, date: —". The fix is to
+    # run the ENTIRE record through `_to_dynamo` (which recursively
+    # walks dicts/lists/sets and converts every float it finds).
     try:
-        record_for_dynamo = dict(expense_record)
-        for key_ in ("amount", "original_amount", "fx_rate"):
-            record_for_dynamo[key_] = Decimal(str(record_for_dynamo[key_]))
+        from services.dynamo import _to_dynamo
+        record_for_dynamo = _to_dynamo(expense_record)
         table.put_item(Item=record_for_dynamo)
         print(f"[ingest] Wrote expense_id={expense_record['expense_id']} to {TABLE_NAME}")
     except Exception as exc:
@@ -379,6 +540,31 @@ def lambda_handler(event, context):
             "statusCode": 500,
             "body": json.dumps({"error": "dynamodb_write_failed", "detail": str(exc)}),
         }
+
+    # ---- 6a. Store a fingerprint row for future duplicate detection ----
+    # The fraud pipeline already compared this receipt against existing
+    # fingerprints; now we store the new receipt's fingerprint so the
+    # NEXT upload can compare against it. Wrapped in try/except —
+    # failure here doesn't roll back the expense record (which would be
+    # worse: the user sees a 500 even though their receipt was
+    # successfully written). The fingerprints table is best-effort.
+    if file_hash is not None:
+        try:
+            from services.dynamo import put_receipt_fingerprint
+            put_receipt_fingerprint(
+                file_hash=file_hash,
+                phash=phash,
+                content_fingerprint=expense_record.get("content_fingerprint"),
+                user_id=user_id,
+                expense_id=expense_record["expense_id"],
+                s3_key=key,
+                vendor=vendor,
+                date=date_str,
+                amount=original_amount,
+                invoice_number=parsed.get("invoice_number"),
+            )
+        except Exception as exc:
+            print(f"[ingest] Fingerprint storage failed (non-fatal): {exc}")
 
     # ---- 7. Publish an alert for anything flagged ----
     if flags:

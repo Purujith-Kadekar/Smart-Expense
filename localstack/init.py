@@ -3,7 +3,7 @@
 
 Creates:
   - S3 bucket:        receipts-bucket  (+ CORS, so the browser can PUT to it)
-  - DynamoDB tables:  ExpenseRecords, Users, Budgets
+  - DynamoDB tables:  ExpenseRecords, Users, Budgets, ReceiptFingerprints
   - SNS topic:        ExpenseAlerts
 
 No demo data is seeded — the app starts empty and users register via the UI.
@@ -40,6 +40,7 @@ BUCKET = os.environ.get("S3_BUCKET", "receipts-bucket")
 EXPENSES_TABLE = os.environ.get("TABLE_NAME", "ExpenseRecords")
 USERS_TABLE = os.environ.get("USERS_TABLE_NAME", "Users")
 BUDGETS_TABLE = os.environ.get("BUDGETS_TABLE_NAME", "Budgets")
+FINGERPRINTS_TABLE = os.environ.get("FINGERPRINTS_TABLE_NAME", "ReceiptFingerprints")
 SNS_TOPIC_NAME = os.environ.get("SNS_TOPIC_NAME", "ExpenseAlerts")
 
 # Origins the browser may PUT receipts from. 5173 is the nginx-served build,
@@ -164,6 +165,25 @@ def create_tables(dynamo):
             ],
             "BillingMode": "PAY_PER_REQUEST",
         },
+        # ReceiptFingerprints — fraud-detection table. Partition key is
+        # the SHA-256 of the original file bytes (string), so an exact-
+        # duplicate lookup is a single get_item. The perceptual hash
+        # (phash) is stored as a Number; the duplicate checker scans
+        # the table and computes Hamming distance in-process — fine at
+        # demo scale. At any real scale, add a GSI on a `phash_bucket`
+        # attribute (top 16 bits of phash) for sublinear locality-
+        # sensitive hashing. The table is optional — the fraud pipeline
+        # tolerates its absence (skips cross-receipt duplicate
+        # detection and falls back to the in-process scan of
+        # ExpenseRecords).
+        {
+            "TableName": FINGERPRINTS_TABLE,
+            "AttributeDefinitions": [
+                {"AttributeName": "file_hash", "AttributeType": "S"},
+            ],
+            "KeySchema": [{"AttributeName": "file_hash", "KeyType": "HASH"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        },
     ]
     for tbl in tables:
         name = tbl["TableName"]
@@ -238,7 +258,7 @@ def main():
 
     print("[init] ------------------------------------------------------")
     print(f"[init] Bucket:  {BUCKET}")
-    print(f"[init] Tables:  {EXPENSES_TABLE}, {USERS_TABLE}, {BUDGETS_TABLE}")
+    print(f"[init] Tables:  {EXPENSES_TABLE}, {USERS_TABLE}, {BUDGETS_TABLE}, {FINGERPRINTS_TABLE}")
     print(f"[init] Topic:   {arn}")
     if args.aws:
         print("[init] REAL AWS mode — then point the backend at it:")

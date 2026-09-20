@@ -11,3 +11,11 @@ python-dotenv==1.0.1
 gunicorn==22.0.0
 bcrypt==4.1.3
 PyJWT==2.9.0
+# Pillow — used by the fraud-detection system (services/fraud/) for:
+#   * safe image loading (decompression bomb / corrupt guards)
+#   * EXIF metadata inspection
+#   * Error Level Analysis (JPEG re-compression diff)
+# Already installed by the OCR path in the Dockerfile (Pillow==10.4.0),
+# but pinning it here keeps the version consistent for non-Docker dev
+# (e.g. python app.py on the host).
+Pillow==10.4.0

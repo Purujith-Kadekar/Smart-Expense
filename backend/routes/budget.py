@@ -33,8 +33,15 @@ def _current_month():
     return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
-def _validate_month(month):
-    """Return True if `month` matches YYYY-MM with a valid month 01-12."""
+def _validate_month(month, allow_all=False):
+    """Return True if `month` matches YYYY-MM with a valid month 01-12.
+
+    When `allow_all` is set, the sentinel "all" is also accepted. Only the
+    GET side allows it — you cannot *set* an all-time budget, but you can
+    ask for an all-time spending total (the dashboard's "All time" view).
+    """
+    if allow_all and month == "all":
+        return True
     return bool(month and _MONTH_RE.match(month))
 
 
@@ -103,13 +110,19 @@ def get_budget_status():
     configures their first budget.
     """
     month = (request.args.get("month") or "").strip() or _current_month()
-    if not _validate_month(month):
+    if not _validate_month(month, allow_all=True):
         return jsonify({
             "error": "invalid_month",
-            "hint": "month must be 'YYYY-MM' (e.g. '2026-09'), zero-padded.",
+            "hint": "month must be 'YYYY-MM' (e.g. '2026-09'), zero-padded, "
+                    "or 'all' for an all-time total.",
         }), 400
 
-    budget = get_budget(user_id=request.user_id, month=month)
+    # "all" is the dashboard's all-time view. There is no all-time budget
+    # row, so limit/income stay 0 and only total_spent is meaningful — the
+    # client keys off `all_time` to label the widgets accordingly instead
+    # of rendering "spent ₹x of ₹0 limit".
+    all_time = month == "all"
+    budget = None if all_time else get_budget(user_id=request.user_id, month=month)
     budget_limit = float(budget["budget_limit"]) if budget else 0.0
     income = float(budget["income"]) if budget else 0.0
 
@@ -126,6 +139,7 @@ def get_budget_status():
 
     return jsonify({
         "month": month,
+        "all_time": all_time,
         "budget_limit": budget_limit,
         "income": income,
         "total_spent": total_spent,

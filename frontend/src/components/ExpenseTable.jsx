@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import api from "../api/client.js";
 
 // Liquid Glass ExpenseTable.
@@ -42,6 +42,25 @@ export default function ExpenseTable({ expenses }) {
   const [sending, setSending] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+
+  // Clear the selection whenever the visible set of receipts changes —
+  // most importantly when the user switches the month selector in the
+  // dashboard. Without this, stale `expense_id`s from a previous month
+  // would survive in `selected`, the summary would read "N selected"
+  // for rows that no longer exist, and the email endpoint would 403
+  // (receipt_not_owned) because those ids belong to a different month's
+  // payload. We key on a stable signature of the current row ids so the
+  // effect only fires when the *membership* changes, not on every poll
+  // refresh that returns equivalent data.
+  const visibleIds = (expenses || [])
+    .map((e) => e.expense_id)
+    .filter(Boolean)
+    .join("|");
+  useEffect(() => {
+    setSelected(new Set());
+    setMessage("");
+    setError("");
+  }, [visibleIds]);
 
   // Empty state — identical copy and intent as the original.
   if (!expenses || expenses.length === 0) {
@@ -224,6 +243,17 @@ export default function ExpenseTable({ expenses }) {
                     </td>
                     <td className="px-4 py-3 text-right text-ink-900 font-semibold tabular-nums">
                       ₹{Number(e.amount || 0).toLocaleString()}
+                      {/* `amount` is the INR value frozen at ingest. For a
+                          foreign receipt the bare rupee figure is
+                          unauditable on its own — show what the receipt
+                          actually said and the rate that was applied. */}
+                      {e.currency && e.currency !== "INR" && e.original_amount != null && (
+                        <div className="text-[11px] font-normal text-ink-400 mt-0.5">
+                          {e.currency} {Number(e.original_amount).toLocaleString()}
+                          {e.fx_rate ? ` @ ${Number(e.fx_rate).toLocaleString()}` : ""}
+                          {e.fx_source && e.fx_source !== "live" ? ` (${e.fx_source})` : ""}
+                        </div>
+                      )}
                     </td>
                     <td className="px-4 py-3 text-center">
                       {e.over_budget ? (

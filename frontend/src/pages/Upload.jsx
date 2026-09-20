@@ -20,6 +20,11 @@ const CATEGORIES = [
   { value: "other", label: "Other" },
 ];
 
+function currentMonth() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
 const CATEGORY_META = {
   college: { color: "blue", emoji: "🎓" },
   mess: { color: "amber", emoji: "🍽" },
@@ -77,11 +82,39 @@ export default function Upload() {
           const ocrData = ocrResp.data || {};
           if (ocrData.triggered && ocrData.expense) {
             const e = ocrData.expense;
+            // Surface the fraud analysis to the user. The fraud_level
+            // comes back on the expense record from the ingest Lambda.
+            // We surface it as a clear prefix so the user can see at a
+            // glance whether their receipt was auto-approved, queued
+            // for human review, or flagged as suspicious.
+            const fraudLevel = (e.fraud_level || "VALID").toUpperCase();
+            const fraudScore = Number(e.fraud_score || 0);
+            let fraudBanner = "";
+            if (fraudLevel === "FLAGGED") {
+              fraudBanner = `⚠ FRAUD FLAGGED (score ${fraudScore}/100). `;
+              if (e.fraud_result && Array.isArray(e.fraud_result.reasons)
+                  && e.fraud_result.reasons.length > 0) {
+                fraudBanner += `Reasons: ${e.fraud_result.reasons.join("; ")}. `;
+              }
+            } else if (fraudLevel === "REVIEW") {
+              fraudBanner = `Queued for human review (score ${fraudScore}/100). `;
+            }
+            // The receipt is filed under the date OCR'd from the receipt
+            // itself, which is frequently NOT the month we're in. The
+            // dashboard scopes every widget to its month picker (default:
+            // today's month), so telling the user to "open the Dashboard"
+            // without saying which month sends them to an empty table for a
+            // record that was written perfectly well. Say the month.
+            const receiptMonth = String(e.date || "").slice(0, 7);
+            const where =
+              receiptMonth && receiptMonth !== currentMonth()
+                ? ` This receipt is dated ${e.date}, so set the Dashboard month picker to ${receiptMonth} (or hit "All time") to see it — it won't appear under ${currentMonth()}.`
+                : " Open the Dashboard to see it.";
             setStatus("success");
             setMessage(
-              `Receipt processed — vendor: ${e.vendor || "Unknown"}, ` +
+              `${fraudBanner}Receipt processed — vendor: ${e.vendor || "Unknown"}, ` +
               `amount: ₹${Number(e.amount || 0).toLocaleString()}, ` +
-              `date: ${e.date || "—"}. Open the Dashboard to see it.`
+              `date: ${e.date || "—"}.${where}`
             );
           } else {
             setStatus("success");

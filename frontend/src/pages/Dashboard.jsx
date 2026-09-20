@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import api from "../api/client.js";
 import ExpenseTable from "../components/ExpenseTable.jsx";
 import BudgetChart from "../components/BudgetChart.jsx";
@@ -7,17 +7,43 @@ import IncomeSavingsChart from "../components/IncomeSavingsChart.jsx";
 
 // Liquid Glass Dashboard.
 //
-// Logic preserved bit-for-bit:
+// Data-flow (post month-filter fix):
 //   - month picker (defaults to current YYYY-MM)
-//   - GET /expenses + GET /budget?month=… in parallel
+//   - GET /expenses?month=YYYY-MM + GET /budget?month=YYYY-MM in parallel
 //   - 15s auto-poll via setInterval
-//   - re-fetch on month change (useEffect dependency)
+//   - re-fetch on month change (useEffect dependency = [month])
 //   - errors surfaced from err.response.data.error
-//   - expenses list is NOT filtered by month (only the budget is)
+//   - the `expenses` array is ALREADY month-scoped by the backend, so the
+//     stat cards, CategoryChart, and ExpenseTable all stay in sync with
+//     the active month selector in the top-right
 //   - three charts: budget status, income vs spent vs savings, category
 //   - expense table below with multi-select + email feature
+//
+// Month-visibility fix:
+//   Every widget is scoped to the selected month, and the selected month
+//   defaults to *today's* month. A receipt is filed under the date printed
+//   on it (OCR'd at ingest), not the date it was uploaded — so uploading a
+//   receipt dated 2026-03-18 in September put a real row in DynamoDB that
+//   the dashboard then filtered out, with no way to tell that apart from
+//   "you have no receipts". We now also fetch GET /expenses/months (the
+//   months that actually contain receipts) and, when the selected month is
+//   empty but others are not, show a banner with one-click jumps plus an
+//   "All time" view. Nothing is silently hidden any more.
 
 const POLL_INTERVAL_MS = 15000;
+
+// Sentinel understood by GET /expenses?month= and GET /budget?month=.
+const ALL_TIME = "all";
+
+function monthLabel(m) {
+  if (m === ALL_TIME) return "all time";
+  if (!m || m === "unknown") return "no date";
+  const [y, mo] = m.split("-");
+  const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const name = names[Number(mo) - 1];
+  return name ? `${name} ${y}` : m;
+}
 
 function currentMonth() {
   const now = new Date();
@@ -61,25 +87,65 @@ export default function Dashboard() {
   const [expenses, setExpenses] = useState([]);
   const [budget, setBudget] = useState(null);
   const [month, setMonth] = useState(currentMonth());
+  // Months that actually contain receipts — powers the "your receipts are
+  // in another month" banner below. Never used to filter anything.
+  const [availableMonths, setAvailableMonths] = useState([]);
+  // One-shot guard for the auto-jump below. Once the user has been moved
+  // (or has touched the picker themselves) we never move them again — an
+  // auto-jump that fires on every poll would fight the user's own choice.
+  // A ref, not state: the 15s poll captures `refresh` in a closure that is
+  // only rebuilt when `month` changes, so a state flag would read stale
+  // inside the interval. A ref is always current.
+  const autoJumped = useRef(false);
+  const setAutoJumped = (v) => {
+    autoJumped.current = v;
+  };
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
 
-  // Same fetch logic as the original — Promise.all on /expenses + /budget.
-  // The only addition is the `refreshing` flag for the button spinner; it
-  // doesn't change the underlying fetch behavior.
+  // Fetch /expenses and /budget in parallel. BOTH are scoped to the
+  // active `month` — passing { params: { month } } on /expenses is the
+  // fix for the original bug where the category chart + expense table
+  // were showing all-time data while the top stat cards were correctly
+  // month-scoped. Now all three widgets pull from the same filtered
+  // payload, so they can never drift out of sync.
   const refresh = async () => {
     setRefreshing(true);
     try {
-      const [expRes, budgetRes] = await Promise.all([
-        api.get("/expenses"),
+      const [expRes, budgetRes, monthsRes] = await Promise.all([
+        api.get("/expenses", { params: { month } }),
         api.get("/budget", { params: { month } }).catch((err) => {
           console.warn("budget fetch failed", err);
+          return null;
+        }),
+        // Best-effort: an older backend without this route just means the
+        // banner stays hidden — it must never break the dashboard.
+        api.get("/expenses/months").catch((err) => {
+          console.warn("month summary fetch failed", err);
           return null;
         }),
       ]);
       setExpenses(expRes.data || []);
       if (budgetRes) setBudget(budgetRes.data);
+      const months = monthsRes ? monthsRes.data || [] : [];
+      if (monthsRes) setAvailableMonths(months);
+
+      // Land the user where their data actually is. The picker defaults to
+      // today's month, but a receipt is filed under the date printed on it
+      // — upload a March-dated receipt in September and the default view is
+      // empty even though the record exists. On the FIRST load only, if the
+      // default month has nothing and some other month does, jump to the
+      // most recent month that has receipts. The banner still explains what
+      // happened, and the picker still overrides this.
+      if (!autoJumped.current && month === currentMonth() && (expRes.data || []).length === 0) {
+        const newest = months.find((m) => m.month && m.month !== "unknown");
+        setAutoJumped(true);
+        if (newest && newest.month !== month) {
+          setMonth(newest.month);
+          return; // the month change re-triggers refresh via useEffect
+        }
+      }
       setError("");
     } catch (err) {
       console.error(err);
@@ -131,6 +197,15 @@ export default function Dashboard() {
   const income = Number(budget?.income || 0);
   const savings = Number(budget?.savings || 0);
   const overBudgetCount = (expenses || []).filter((e) => e.over_budget).length;
+  const isAllTime = month === ALL_TIME;
+
+  // Receipts that exist but are NOT in the current view. This is what makes
+  // the "processed but nowhere to be seen" case visible instead of silent.
+  const elsewhere = (availableMonths || []).filter(
+    (m) => !isAllTime && m.month !== month
+  );
+  const elsewhereCount = elsewhere.reduce((n, m) => n + Number(m.count || 0), 0);
+  const showElsewhereBanner = elsewhereCount > 0;
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -142,7 +217,8 @@ export default function Dashboard() {
             Budget overview
           </h2>
           <p className="text-sm text-ink-500 mt-1">
-            Live view of your spending vs. budget for {month}. Auto-refreshes every 15s.
+            Live view of your spending vs. budget for {monthLabel(month)}.
+            Auto-refreshes every 15s.
           </p>
         </div>
 
@@ -154,11 +230,26 @@ export default function Dashboard() {
             <input
               type="month"
               id="month"
-              value={month}
-              onChange={(e) => setMonth(e.target.value)}
-              className="bg-transparent text-sm text-ink-900 focus:outline-none focus:ring-0 border-0 p-0 cursor-pointer"
+              value={isAllTime ? "" : month}
+              onChange={(e) => {
+                setAutoJumped(true);
+                setMonth(e.target.value || currentMonth());
+              }}
+              disabled={isAllTime}
+              className="bg-transparent text-sm text-ink-900 focus:outline-none focus:ring-0 border-0 p-0 cursor-pointer disabled:opacity-40"
             />
           </div>
+          <button
+            onClick={() => {
+              setAutoJumped(true);
+              setMonth(isAllTime ? currentMonth() : ALL_TIME);
+            }}
+            className={`btn-secondary !px-3 !py-2.5 ${isAllTime ? "!text-brand-700" : ""}`}
+            title={isAllTime ? "Back to a single month" : "Show every receipt, any month"}
+            aria-pressed={isAllTime}
+          >
+            <span>{isAllTime ? "Monthly" : "All time"}</span>
+          </button>
           <button
             onClick={refresh}
             disabled={refreshing}
@@ -184,29 +275,79 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* ───────── "Your receipts are in another month" banner ─────────
+          A receipt is filed under the date OCR'd from the receipt itself,
+          which is often not the month you uploaded it in. Without this
+          banner the dashboard just renders an empty table and the user has
+          no way to know the record exists. */}
+      {showElsewhereBanner && (
+        <div className="flex flex-wrap items-center gap-2.5 text-amber-900 text-sm bg-amber-50/70 border border-amber-200/80 rounded-xl p-3 animate-fade-in">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+            strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4 shrink-0">
+            <rect x="3" y="4" width="18" height="17" rx="2" />
+            <path d="M8 2v4M16 2v4M3 10h18" />
+          </svg>
+          <span>
+            {(expenses || []).length === 0
+              ? `No receipts dated ${monthLabel(month)}, but you have ${elsewhereCount} in other months.`
+              : `${elsewhereCount} more receipt(s) are dated outside ${monthLabel(month)}.`}
+            {" "}Receipts are filed by the date printed on them, not the upload date.
+          </span>
+          <span className="flex flex-wrap items-center gap-1.5">
+            {elsewhere.slice(0, 6).map((m) => (
+              <button
+                key={m.month}
+                onClick={() => {
+                  setAutoJumped(true);
+                  if (m.month !== "unknown") setMonth(m.month);
+                }}
+                disabled={m.month === "unknown"}
+                className="px-2 py-1 rounded-lg bg-white/70 border border-amber-200 text-xs font-medium hover:bg-white disabled:opacity-60 disabled:cursor-default"
+                title={m.month === "unknown" ? "Receipts with no readable date" : `Jump to ${monthLabel(m.month)}`}
+              >
+                {monthLabel(m.month)} · {m.count}
+              </button>
+            ))}
+            <button
+              onClick={() => {
+                setAutoJumped(true);
+                setMonth(ALL_TIME);
+              }}
+              className="px-2 py-1 rounded-lg bg-white/70 border border-amber-200 text-xs font-medium hover:bg-white"
+            >
+              All time
+            </button>
+          </span>
+        </div>
+      )}
+
       {/* ───────── Stat tiles ───────── */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatTile
-          label="Spent (month)"
-          value={`₹${Number(budget?.total_spent || 0).toLocaleString()}`}
-          subtext={`of ₹${budgetLimit.toLocaleString()} limit`}
+          label={isAllTime ? "Spent (all time)" : "Spent (month)"}
+          value={`₹${totalSpent.toLocaleString()}`}
+          subtext={
+            isAllTime || budgetLimit <= 0
+              ? `${(expenses || []).length} receipt(s)`
+              : `of ₹${budgetLimit.toLocaleString()} limit`
+          }
           icon={Icon.Wallet}
           tone="brand"
         />
-        <StatTile
+        {!isAllTime && <StatTile
           label="Income"
           value={`₹${income.toLocaleString()}`}
-          subtext={`for ${month}`}
+          subtext={`for ${monthLabel(month)}`}
           icon={Icon.Piggy}
           tone="emerald"
-        />
-        <StatTile
+        />}
+        {!isAllTime && <StatTile
           label="Savings"
           value={`₹${savings.toLocaleString()}`}
           subtext={savings >= 0 ? "under budget" : "overspent"}
           icon={Icon.Piggy}
           tone={savings >= 0 ? "emerald" : "rose"}
-        />
+        />}
         <StatTile
           label="Over budget"
           value={String(overBudgetCount)}
@@ -217,10 +358,15 @@ export default function Dashboard() {
       </div>
 
       {/* ───────── Chart row 1: budget status (left) + income/savings (right) ───────── */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {budget && <BudgetChart budget={budget} />}
-        <IncomeSavingsChart budget={budget} />
-      </div>
+      {/* Budget/income charts are monthly by definition — there is no
+          all-time budget row, so rendering them in the all-time view would
+          just show "₹x of ₹0 limit". */}
+      {!isAllTime && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {budget && <BudgetChart budget={budget} />}
+          <IncomeSavingsChart budget={budget} />
+        </div>
+      )}
 
       {/* ───────── Chart row 2: category breakdown — full width ───────── */}
       <CategoryChart expenses={expenses} />

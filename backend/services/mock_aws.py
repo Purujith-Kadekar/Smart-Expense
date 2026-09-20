@@ -95,11 +95,19 @@ class _MockDynamoTable:
 _EXPENSES_TABLE = os.environ.get("TABLE_NAME", "ExpenseRecords")
 _USERS_TABLE = os.environ.get("USERS_TABLE_NAME", "Users")
 _BUDGETS_TABLE = os.environ.get("BUDGETS_TABLE_NAME", "Budgets")
+_FINGERPRINTS_TABLE = os.environ.get("FINGERPRINTS_TABLE_NAME", "ReceiptFingerprints")
 
 _TABLE_KEYS = {
     _EXPENSES_TABLE: ("expense_id", None),
     _USERS_TABLE: ("user_id", None),
     _BUDGETS_TABLE: ("user_id", "month"),
+    # Fraud-detection table — partition key is the SHA-256 file hash.
+    # If this entry is missing, the mock falls back to ("id", None)
+    # and put_receipt_fingerprint() raises KeyError (caught by the
+    # try/except in dynamo.py, but means duplicate-detection can't
+    # store fingerprints in mock mode — silently degrading fraud
+    # detection).
+    _FINGERPRINTS_TABLE: ("file_hash", None),
     # Legacy aliases so a stale env var or an old test fixture still gets
     # the right key schema instead of silently falling back to "id".
     "ExpenseRecords": ("expense_id", None),
@@ -502,7 +510,7 @@ def mock_item_counts():
     """Item count per mock table (mock mode only). Ensures each table object
     exists (and is hydrated from the persist file) before counting."""
     counts = {}
-    for name in {_EXPENSES_TABLE, _USERS_TABLE, _BUDGETS_TABLE}:
+    for name in {_EXPENSES_TABLE, _USERS_TABLE, _BUDGETS_TABLE, _FINGERPRINTS_TABLE}:
         table = _DYNAMO.Table(name)
         with table._lock:
             counts[name] = len(table._items)
